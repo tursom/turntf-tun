@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 
 	"github.com/songgao/water"
@@ -58,6 +59,26 @@ func (d *TUNDevice) ReadPacket(ctx context.Context) ([]byte, error) {
 }
 func (d *TUNDevice) WritePacket(packet []byte) error { _, err := d.ifce.Write(packet); return err }
 func (d *TUNDevice) Close() error                    { return d.ifce.Close() }
+func configureTUNRoutes(name string, peers []PeerConfig) error {
+	link, err := netlink.LinkByName(name)
+	if err != nil {
+		return fmt.Errorf("find tun link %s for routes: %w", name, err)
+	}
+	for _, peer := range peers {
+		for _, raw := range peer.Routes {
+			_, dst, err := net.ParseCIDR(raw)
+			if err != nil {
+				return fmt.Errorf("parse peer route %q: %w", raw, err)
+			}
+			route := &netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst, Scope: netlink.SCOPE_LINK}
+			if err := netlink.RouteReplace(route); err != nil {
+				return fmt.Errorf("install peer route %q: %w", raw, err)
+			}
+		}
+	}
+	return nil
+}
+
 func configureTUN(name string, cfg TunConfig) error {
 	link, err := netlink.LinkByName(name)
 	if err != nil {

@@ -6,7 +6,7 @@
 
 - 只传输 IP packet，不传 Ethernet header、MAC、ARP 或广播帧。
 - 每个 peer 配置明确的 CIDR 路由，支持 IPv4 和 IPv6。
-- Relay 固定使用 `best_effort`：无 ACK、无 Relay 重传、无 Relay 排序，避免与 IP 层上面的 TCP 重传叠加。
+- Relay 使用 `at_least_once`：帧有 ACK 和有限重传，但不做可靠有序重排，避免把跨流 TCP 的队头阻塞引入 IP overlay；IP 层上面的 TCP/UDP 仍负责自己的语义。
 - 每个 peer 有界发送队列；队列满时丢包，TUN 读循环不会等待慢 Relay。
 - 每个 peer 使用独立的 Relay 连接和收发循环，单个出口拥塞不会阻塞其他 peer。
 - TUN MTU 应按实际出口和 turntf 封装开销选择。默认 `1400`，部署后可通过吞吐、丢包和长尾测试调整。
@@ -56,7 +56,7 @@ docker run --rm \
 `deploy/docker-compose.yml` 是三台节点共用的 Compose 定义，生产镜像固定为已核实的 digest：
 
 ```text
-ghcr.io/tursom/turntf-tun@sha256:0d7f09a49a19aac01006b285433e1af330bfa435d367e5113ed3d68c4647a707
+ghcr.io/tursom/turntf-tun@sha256:ab581c485bc8aecaf324f4b71e3ae8765e30c35fc1956fcae381f9fa0dea2d19
 ```
 
 三份节点模板位于 `deploy/kr/config.example.yaml`、`deploy/cc/config.example.yaml` 和 `deploy/kiwi/config.example.yaml`。模板不包含真实密码和 peer ID，填充后应保存为节点本地 `/opt/turntf/tun/config.yaml`，权限设置为 `0600`；部署目录设置为 `0700`。
@@ -69,7 +69,7 @@ chmod 700 /opt/turntf/tun
 install -m 600 config.yaml /opt/turntf/tun/config.yaml
 install -m 600 docker-compose.yml /opt/turntf/tun/docker-compose.yml
 cd /opt/turntf/tun
-export IMAGE_REF='ghcr.io/tursom/turntf-tun@sha256:0d7f09a49a19aac01006b285433e1af330bfa435d367e5113ed3d68c4647a707'
+export IMAGE_REF='ghcr.io/tursom/turntf-tun@sha256:ab581c485bc8aecaf324f4b71e3ae8765e30c35fc1956fcae381f9fa0dea2d19'
 docker compose config
 docker compose pull
 docker compose up -d
@@ -78,12 +78,12 @@ docker compose ps
 
 容器只使用 host network、`/dev/net/tun` 和 `NET_ADMIN`，没有使用 `privileged`。启动前必须把模板中的 `REPLACE_*`、`node_id` 和 `user_id` 替换为真实值；`node_id: 0` 或占位密码不能用于生产启动。
 
-三台节点的建议虚拟地址为：
+三台节点的建议虚拟地址为（本地使用 `/32`，对端路由由程序按 `peers.routes` 安装）：
 
 ```text
-kr    10.250.0.1/24
-cc    10.250.0.2/24
-kiwi  10.250.0.3/24
+kr    10.250.0.1/32
+cc    10.250.0.2/32
+kiwi  10.250.0.3/32
 ```
 
 停止或回滚时只操作 `/opt/turntf/tun` 这个 Compose 项目，不要停止现有核心、Web、forward、newt 或 udp2raw 服务。生产变更前先备份该目录和配置；部署后验证三节点之间的 ICMP、TCP、UDP 以及容器 restart count。
@@ -97,7 +97,7 @@ kr、cc、kiwi 可以使用同一虚拟网段，但每个节点只把对端地�
 tun:
   name: "turntf0"
   mtu: 1400
-  addresses: ["10.250.0.1/24"]
+  addresses: ["10.250.0.1/32"]
 peers:
   - name: "cc"
     user: {node_id: 1, user_id: 2}

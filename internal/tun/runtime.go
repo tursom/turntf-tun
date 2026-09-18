@@ -67,6 +67,10 @@ func Run(ctx context.Context, cfg Config, logger Logger) error {
 	if err != nil {
 		return err
 	}
+	if err := configureTUNRoutes(device.Name(), cfg.Peers); err != nil {
+		_ = device.Close()
+		return err
+	}
 	return rt.Run(ctx)
 }
 func NewRuntime(cfg Config, device PacketDevice, routes *routeTable, logger Logger) (*Runtime, error) {
@@ -79,7 +83,7 @@ func NewRuntime(cfg Config, device PacketDevice, routes *routeTable, logger Logg
 		return nil, err
 	}
 	relayCfg := turntf.DefaultRelayConfig()
-	relayCfg.Reliability = turntf.ReliabilityBestEffort
+	relayCfg.Reliability = turntf.ReliabilityAtLeastOnce
 	relayCfg.DeliveryMode = turntf.DeliveryModeBestEffort
 	relayCfg.SendBufferSize = relaySendBufferBytes
 	return &Runtime{cfg: cfg, logger: logger, device: device, client: client, relay: client.Relay(), relayCfg: relayCfg, routes: routes, ports: make(map[turntf.UserRef]*peerPort)}, nil

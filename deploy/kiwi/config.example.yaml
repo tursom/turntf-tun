@@ -6,14 +6,14 @@ turntf:
   credentials:
     login_name: "turntf-tun-kiwi"
     password:
-      source: "plain"
+      source: "hashed"
       value: "REPLACE_WITH_KIWI_TUN_PASSWORD"
 
 tun:
   name: "turntf0"
   mtu: 1400
   addresses:
-    - "10.250.0.3/24"
+    - "10.250.0.3/32"
   bring_up: true
 
 transport:

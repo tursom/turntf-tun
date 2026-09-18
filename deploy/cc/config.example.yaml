@@ -6,14 +6,14 @@ turntf:
   credentials:
     login_name: "turntf-tun-cc"
     password:
-      source: "plain"
+      source: "hashed"
       value: "REPLACE_WITH_CC_TUN_PASSWORD"
 
 tun:
   name: "turntf0"
   mtu: 1400
   addresses:
-    - "10.250.0.2/24"
+    - "10.250.0.2/32"
   bring_up: true
 
 transport:

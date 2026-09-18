@@ -26,7 +26,7 @@ tun:
   name: "turntf0"
   mtu: 1400
   addresses:
-    - "10.250.0.1/24"
+    - "10.250.0.1/32"
   bring_up: true
 
 transport:
