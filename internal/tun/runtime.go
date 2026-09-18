@@ -83,7 +83,7 @@ func NewRuntime(cfg Config, device PacketDevice, routes *routeTable, logger Logg
 		return nil, err
 	}
 	relayCfg := turntf.DefaultRelayConfig()
-	relayCfg.Reliability = turntf.ReliabilityAtLeastOnce
+	relayCfg.Reliability = turntf.ReliabilityBestEffort
 	relayCfg.DeliveryMode = turntf.DeliveryModeBestEffort
 	relayCfg.SendBufferSize = relaySendBufferBytes
 	return &Runtime{cfg: cfg, logger: logger, device: device, client: client, relay: client.Relay(), relayCfg: relayCfg, routes: routes, ports: make(map[turntf.UserRef]*peerPort)}, nil
