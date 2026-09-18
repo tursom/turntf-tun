@@ -24,6 +24,33 @@ sudo ./turntf-tun run -c config.yaml
 
 需要 Linux、root 或 `CAP_NET_ADMIN`，以及每个节点独立的 turntf 登录账号。
 
+## 容器镜像
+
+`master`、`v*` tag 和手动触发的 GitHub Actions 会在测试通过后把单平台 Linux 镜像推送到：
+
+```text
+ghcr.io/tursom/turntf-tun
+```
+
+每次发布都有 `sha-<commit>` 标签；`master` 同时更新 `latest`。本地构建：
+
+```bash
+docker build --platform linux/amd64 -t turntf-tun:local .
+```
+
+容器必须显式映射 TUN 设备并授予 `NET_ADMIN`，配置文件应只读挂载：
+
+```bash
+docker run --rm \
+  --device /dev/net/tun:/dev/net/tun \
+  --cap-add NET_ADMIN \
+  -v "$PWD/config.yaml:/etc/turntf/config.yaml:ro" \
+  ghcr.io/tursom/turntf-tun:latest \
+  run -c /etc/turntf/config.yaml
+```
+
+不要把 turntf 密码写入镜像或提交到仓库。生产配置应使用宿主机权限受限的文件或容器编排系统的 secret 挂载。镜像不需要 `--privileged`；只有部署环境无法单独映射 TUN 设备或 capability 时，才应评估更宽权限及其风险。
+
 ## 路由示例
 
 kr、cc、kiwi 可以使用同一虚拟网段，但每个节点只把对端地址路由给对应 peer：
