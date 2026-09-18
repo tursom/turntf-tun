@@ -73,6 +73,7 @@ type Config struct {
 	Turntf    TurntfConfig    `yaml:"turntf"`
 	Tun       TunConfig       `yaml:"tun"`
 	Transport TransportConfig `yaml:"transport"`
+	Overlay   OverlayConfig   `yaml:"overlay"`
 	Peers     []PeerConfig    `yaml:"peers"`
 }
 type TurntfConfig struct {
@@ -80,6 +81,14 @@ type TurntfConfig struct {
 	Credentials    CredentialsConfig `yaml:"credentials"`
 	RequestTimeout Duration          `yaml:"request_timeout"`
 	PingInterval   Duration          `yaml:"ping_interval"`
+}
+type OverlayConfig struct {
+	Enabled       bool     `yaml:"enabled"`
+	Database      string   `yaml:"database"`
+	StaticAddress string   `yaml:"static_address"`
+	PoolStart     string   `yaml:"pool_start"`
+	PoolEnd       string   `yaml:"pool_end"`
+	LeaseDuration Duration `yaml:"lease_duration"`
 }
 type CredentialsConfig struct {
 	NodeID    int64          `yaml:"node_id"`
@@ -135,6 +144,9 @@ func (c *Config) ApplyDefaults() {
 	if c.Turntf.PingInterval.Duration == 0 {
 		c.Turntf.PingInterval.Duration = 30 * time.Second
 	}
+	if c.Overlay.LeaseDuration.Duration == 0 {
+		c.Overlay.LeaseDuration.Duration = 10 * time.Minute
+	}
 	if c.Tun.Name == "" {
 		c.Tun.Name = "turntf0"
 	}
@@ -163,9 +175,18 @@ func (c Config) Validate() error {
 	if _, err := c.Turntf.Credentials.ToTurntf(); err != nil {
 		return fmt.Errorf("turntf.credentials: %w", err)
 	}
-	if strings.TrimSpace(c.Tun.Name) == "" {
-		return errors.New("tun.name is required")
+	if c.Overlay.Enabled {
+		if strings.TrimSpace(c.Overlay.Database) == "" {
+			return errors.New("overlay.database is required")
+		}
+		if c.Overlay.StaticAddress == "" && (c.Overlay.PoolStart == "" || c.Overlay.PoolEnd == "") {
+			return errors.New("overlay requires static_address or pool_start/pool_end")
+		}
+		if c.Overlay.LeaseDuration.Duration < time.Minute {
+			return errors.New("overlay.lease_duration must be at least 1m")
+		}
 	}
+
 	if c.Tun.MTU < 576 || c.Tun.MTU > 65535 {
 		return errors.New("tun.mtu must be between 576 and 65535")
 	}

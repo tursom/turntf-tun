@@ -38,22 +38,45 @@ func (p *peerPort) enqueue(packet []byte) bool {
 }
 
 type Runtime struct {
-	cfg      Config
-	logger   Logger
-	device   PacketDevice
-	client   *turntf.Client
-	relay    *turntf.Relay
-	relayCfg turntf.RelayConfig
-	routes   *routeTable
-	mu       sync.RWMutex
-	ports    map[turntf.UserRef]*peerPort
-	writeMu  sync.Mutex
+	cfg       Config
+	logger    Logger
+	device    PacketDevice
+	client    *turntf.Client
+	relay     *turntf.Relay
+	relayCfg  turntf.RelayConfig
+	routes    *routeTable
+	mu        sync.RWMutex
+	ports     map[turntf.UserRef]*peerPort
+	writeMu   sync.Mutex
+	connected bool
 }
 
 func Run(ctx context.Context, cfg Config, logger Logger) error {
 	cfg.ApplyDefaults()
 	if err := cfg.Validate(); err != nil {
 		return err
+	}
+	rt, err := NewRuntime(cfg, nil, nil, logger)
+	if err != nil {
+		return err
+	}
+	if err := rt.client.Connect(ctx); err != nil {
+		return err
+	}
+	login, ok := rt.client.CurrentLogin()
+	if !ok {
+		return errors.New("turntf client connected without login state")
+	}
+	if cfg.Overlay.Enabled {
+		kvClient := newKVHTTPClient(cfg.Turntf)
+		if err := kvClient.login(ctx, cfg.Turntf.Credentials); err != nil {
+			return err
+		}
+		address, err := kvClient.acquire(ctx, cfg.Overlay, turntf.UserRef{NodeID: login.User.NodeID, UserID: login.User.UserID})
+		if err != nil {
+			return err
+		}
+		cfg.Tun.Addresses = []string{address}
 	}
 	routes, err := newRouteTable(cfg.Peers)
 	if err != nil {
@@ -64,12 +87,8 @@ func Run(ctx context.Context, cfg Config, logger Logger) error {
 		return err
 	}
 	defer device.Close()
-	rt, err := NewRuntime(cfg, device, routes, logger)
-	if err != nil {
-		return err
-	}
+	rt.cfg, rt.routes, rt.device, rt.connected = cfg, routes, device, true
 	if err := configureTUNRoutes(device.Name(), cfg.Peers); err != nil {
-		_ = device.Close()
 		return err
 	}
 	return rt.Run(ctx)
@@ -94,8 +113,10 @@ func (r *Runtime) Run(ctx context.Context) error {
 	defer r.client.Close()
 	r.relay.SetIncomingConfig(r.relayCfg)
 	r.relay.OnConnection(func(conn *turntf.RelayConnection) { r.acceptRelay(ctx, conn) })
-	if err := r.client.Connect(ctx); err != nil {
-		return err
+	if !r.connected {
+		if err := r.client.Connect(ctx); err != nil {
+			return err
+		}
 	}
 	login, ok := r.client.CurrentLogin()
 	if !ok {
