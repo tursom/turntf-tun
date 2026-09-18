@@ -1,0 +1,52 @@
+# Copy to /opt/turntf/tun/config.yaml on router, then replace every REPLACE_* value.
+turntf:
+  base_url: "https://turntf.home.tursom.cn:20080"
+  request_timeout: "10s"
+  ping_interval: "30s"
+  credentials:
+    login_name: "turntf-tun-router-vlan"
+    password:
+      source: "hashed"
+      value: "REPLACE_WITH_ROUTER_TUN_PASSWORD"
+
+tun:
+  name: "turntf0"
+  mtu: 1400
+  addresses:
+    - "10.250.0.4/32"
+  bring_up: true
+
+transport:
+  send_queue_size: 4096
+  max_packet_bytes: 65535
+  dial_retry_interval: "3s"
+
+peers:
+  - name: "kr"
+    user:
+      node_id: 54064871525449607
+      user_id: 1032
+    routes:
+      - "10.250.0.1/32"
+    dial_policy: "auto"
+  - name: "cc"
+    user:
+      node_id: 54064871525449607
+      user_id: 1033
+    routes:
+      - "10.250.0.2/32"
+    dial_policy: "auto"
+  - name: "kiwi"
+    user:
+      node_id: 54064871525449607
+      user_id: 1034
+    routes:
+      - "10.250.0.3/32"
+    dial_policy: "auto"
+  - name: "pangolin"
+    user:
+      node_id: 54064626334500285
+      user_id: 1062
+    routes:
+      - "10.250.0.5/32"
+    dial_policy: "auto"

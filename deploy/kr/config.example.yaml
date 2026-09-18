@@ -36,3 +36,17 @@ peers:
     routes:
       - "10.250.0.3/32"
     dial_policy: "auto"
+  - name: "router"
+    user:
+      node_id: 54064626334500285 # turntf-tun-router-vlan node_id
+      user_id: 1061 # turntf-tun-router-vlan user_id
+    routes:
+      - "10.250.0.4/32"
+    dial_policy: "auto"
+  - name: "pangolin"
+    user:
+      node_id: 54064626334500285 # turntf-tun-pangolin-vlan node_id
+      user_id: 1062 # turntf-tun-pangolin-vlan user_id
+    routes:
+      - "10.250.0.5/32"
+    dial_policy: "auto"
