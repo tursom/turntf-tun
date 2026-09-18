@@ -131,8 +131,8 @@ func (r *Runtime) readTUNLoop(ctx context.Context) {
 		r.mu.RLock()
 		port := r.ports[peer.config.User.ToTurntf()]
 		r.mu.RUnlock()
-		if port == nil || !port.enqueue(packet) {
-			r.logf("drop packet to peer %s: queue full or disconnected", peer.config.Name)
+		if port != nil {
+			port.enqueue(packet)
 		}
 	}
 }
