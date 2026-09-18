@@ -14,6 +14,12 @@ import (
 	turntf "github.com/tursom/turntf-go"
 )
 
+type overlayLease struct {
+	Key      string
+	Address  string
+	Revision uint64
+}
+
 type kvHTTPClient struct {
 	base  string
 	http  *http.Client
@@ -110,17 +116,41 @@ func (c *kvHTTPClient) txn(ctx context.Context, db string, cmp []map[string]any,
 	}
 	return nil
 }
-func (c *kvHTTPClient) acquire(ctx context.Context, cfg OverlayConfig, node turntf.UserRef) (string, error) {
+func (c *kvHTTPClient) put(ctx context.Context, db, key string, value []byte) error {
+	return c.do(ctx, http.MethodPut, "/kv/"+url.PathEscape(db)+"/keys/"+url.PathEscape(key), map[string]any{"value": value}, nil)
+}
+func (c *kvHTTPClient) remove(ctx context.Context, db, key string) error {
+	return c.do(ctx, http.MethodDelete, "/kv/"+url.PathEscape(db)+"/keys/"+url.PathEscape(key), nil, nil)
+}
+func (c *kvHTTPClient) renew(ctx context.Context, cfg OverlayConfig, lease overlayLease, node turntf.UserRef) (overlayLease, error) {
+	entry, err := c.get(ctx, cfg.Database, lease.Key)
+	if err != nil {
+		return lease, err
+	}
+	expires := time.Now().UTC().Add(cfg.LeaseDuration.Duration).Format(time.RFC3339)
+	value, _ := json.Marshal(map[string]any{"node_id": node.NodeID, "user_id": node.UserID, "address": lease.Address, "expires_at": expires})
+	var out kvTxnResponse
+	err = c.do(ctx, http.MethodPost, "/kv/"+url.PathEscape(cfg.Database)+"/txn", map[string]any{"compare": []map[string]any{{"key": lease.Key, "revision": entry.Entry.ModRevision}}, "puts": []map[string]any{{"key": lease.Key, "value": value}}}, &out)
+	if err != nil || !out.Succeeded {
+		if err == nil {
+			err = errors.New("lease renewal compare failed")
+		}
+		return lease, err
+	}
+	lease.Revision = out.Revision
+	return lease, nil
+}
+func (c *kvHTTPClient) acquire(ctx context.Context, cfg OverlayConfig, node turntf.UserRef) (overlayLease, error) {
 	if cfg.StaticAddress != "" {
-		return cfg.StaticAddress, nil
+		return overlayLease{Address: cfg.StaticAddress + "/32"}, nil
 	}
 	start, err := parseIPv4(cfg.PoolStart)
 	if err != nil {
-		return "", err
+		return overlayLease{}, err
 	}
 	end, err := parseIPv4(cfg.PoolEnd)
 	if err != nil {
-		return "", err
+		return overlayLease{}, err
 	}
 	now := time.Now().UTC()
 	expires := now.Add(cfg.LeaseDuration.Duration).Format(time.RFC3339)
@@ -137,14 +167,14 @@ func (c *kvHTTPClient) acquire(ctx context.Context, cfg OverlayConfig, node turn
 			}
 			cmp = []map[string]any{{"key": key, "revision": entry.Entry.ModRevision}}
 		} else if !errors.Is(err, kvNotFound) {
-			return "", err
+			return overlayLease{}, err
 		}
 		value, _ := json.Marshal(map[string]any{"node_id": node.NodeID, "user_id": node.UserID, "address": key[len("leases/by-ip/"):], "expires_at": expires})
 		if c.txn(ctx, cfg.Database, cmp, []map[string]any{{"key": key, "value": value}}) == nil {
-			return key[len("leases/by-ip/"):] + "/32", nil
+			return overlayLease{Key: key, Address: key[len("leases/by-ip/"):] + "/32"}, nil
 		}
 	}
-	return "", errors.New("kv address pool exhausted")
+	return overlayLease{}, errors.New("kv address pool exhausted")
 }
 func parseIPv4(raw string) (uint32, error) {
 	var a, b, c, d int

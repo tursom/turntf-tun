@@ -72,11 +72,12 @@ func Run(ctx context.Context, cfg Config, logger Logger) error {
 		if err := kvClient.login(ctx, cfg.Turntf.Credentials); err != nil {
 			return err
 		}
-		address, err := kvClient.acquire(ctx, cfg.Overlay, turntf.UserRef{NodeID: login.User.NodeID, UserID: login.User.UserID})
+		lease, err := kvClient.acquire(ctx, cfg.Overlay, turntf.UserRef{NodeID: login.User.NodeID, UserID: login.User.UserID})
 		if err != nil {
 			return err
 		}
-		cfg.Tun.Addresses = []string{address}
+		cfg.Tun.Addresses = []string{lease.Address}
+		go renewOverlayLease(ctx, kvClient, cfg.Overlay, lease, turntf.UserRef{NodeID: login.User.NodeID, UserID: login.User.UserID})
 	}
 	routes, err := newRouteTable(cfg.Peers)
 	if err != nil {
