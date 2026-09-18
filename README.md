@@ -6,7 +6,7 @@
 
 - 只传输 IP packet，不传 Ethernet header、MAC、ARP 或广播帧。
 - 每个 peer 配置明确的 CIDR 路由，支持 IPv4 和 IPv6。
-- Relay 使用 `best_effort`：不做 Relay ACK、重传和有序重排，避免高 RTT 链路上的窗口等待；IP 层上面的 TCP/UDP 负责自己的可靠性和重传。
+- Relay 使用 `at_least_once`，并在每个 peer 上把 IP packet 聚合成最多 128 KiB 的 batch；acceptance RPC 有界并行，避免高 RTT 链路上逐包等待，同时不引入可靠有序重排。IP 层上面的 TCP/UDP 仍负责自己的语义。
 - 每个 peer 有界发送队列；队列满时丢包，TUN 读循环不会等待慢 Relay。
 - 每个 peer 使用独立的 Relay 连接和收发循环，单个出口拥塞不会阻塞其他 peer。
 - TUN MTU 应按实际出口和 turntf 封装开销选择。默认 `1400`，部署后可通过吞吐、丢包和长尾测试调整。
