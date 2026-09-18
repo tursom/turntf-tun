@@ -38,17 +38,18 @@ func (p *peerPort) enqueue(packet []byte) bool {
 }
 
 type Runtime struct {
-	cfg       Config
-	logger    Logger
-	device    PacketDevice
-	client    *turntf.Client
-	relay     *turntf.Relay
-	relayCfg  turntf.RelayConfig
-	routes    *routeTable
-	mu        sync.RWMutex
-	ports     map[turntf.UserRef]*peerPort
-	writeMu   sync.Mutex
-	connected bool
+	cfg          Config
+	logger       Logger
+	device       PacketDevice
+	client       *turntf.Client
+	relay        *turntf.Relay
+	relayCfg     turntf.RelayConfig
+	routes       *routeTable
+	mu           sync.RWMutex
+	ports        map[turntf.UserRef]*peerPort
+	writeMu      sync.Mutex
+	connected    bool
+	releaseLease func(context.Context)
 }
 
 func Run(ctx context.Context, cfg Config, logger Logger) error {
@@ -78,6 +79,11 @@ func Run(ctx context.Context, cfg Config, logger Logger) error {
 		}
 		cfg.Tun.Addresses = []string{lease.Address}
 		go renewOverlayLease(ctx, kvClient, cfg.Overlay, lease, turntf.UserRef{NodeID: login.User.NodeID, UserID: login.User.UserID})
+		cfg.Peers, err = discoverOverlayPeers(ctx, kvClient, cfg.Overlay, turntf.UserRef{NodeID: login.User.NodeID, UserID: login.User.UserID}, cfg.Peers)
+		if err != nil {
+			return err
+		}
+		rt.releaseLease = func(releaseCtx context.Context) { _ = kvClient.releaseLease(releaseCtx, cfg.Overlay.Database, lease) }
 	}
 	routes, err := newRouteTable(cfg.Peers)
 	if err != nil {
@@ -91,6 +97,9 @@ func Run(ctx context.Context, cfg Config, logger Logger) error {
 	rt.cfg, rt.routes, rt.device, rt.connected = cfg, routes, device, true
 	if err := configureTUNRoutes(device.Name(), cfg.Peers); err != nil {
 		return err
+	}
+	if rt.releaseLease != nil {
+		defer rt.releaseLease(context.Background())
 	}
 	return rt.Run(ctx)
 }
