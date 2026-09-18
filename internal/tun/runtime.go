@@ -83,7 +83,7 @@ func NewRuntime(cfg Config, device PacketDevice, routes *routeTable, logger Logg
 		return nil, err
 	}
 	relayCfg := turntf.DefaultRelayConfig()
-	relayCfg.Reliability = turntf.ReliabilityBestEffort
+	relayCfg.Reliability = turntf.ReliabilityAtLeastOnce
 	relayCfg.DeliveryMode = turntf.DeliveryModeBestEffort
 	relayCfg.SendBufferSize = relaySendBufferBytes
 	return &Runtime{cfg: cfg, logger: logger, device: device, client: client, relay: client.Relay(), relayCfg: relayCfg, routes: routes, ports: make(map[turntf.UserRef]*peerPort)}, nil
@@ -198,22 +198,56 @@ func (r *Runtime) registerPort(ctx context.Context, peer PeerConfig, conn *turnt
 	return p
 }
 func (r *Runtime) writeRelayLoop(p *peerPort) {
+	var pending []byte
 	for {
-		select {
-		case <-p.done:
-			return
-		case packet := <-p.queue:
-			if err := p.conn.Send(packet); err != nil {
-				r.logf("send peer %s: %v", p.peer.config.Name, err)
-				p.close()
+		if pending == nil {
+			select {
+			case <-p.done:
 				return
+			case pending = <-p.queue:
 			}
+		}
+		batch, ok := appendTunBatch(nil, pending)
+		if !ok {
+			r.logf("drop oversized tun packet for peer %s", p.peer.config.Name)
+			pending = nil
+			continue
+		}
+		pending = nil
+		timer := time.NewTimer(time.Millisecond)
+	collect:
+		for len(batch) < tunBatchMaxBytes {
+			select {
+			case <-p.done:
+				timer.Stop()
+				return
+			case packet := <-p.queue:
+				var added bool
+				batch, added = appendTunBatch(batch, packet)
+				if !added {
+					pending = packet
+					break collect
+				}
+			case <-timer.C:
+				break collect
+			}
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		if err := p.conn.Send(batch); err != nil {
+			r.logf("send peer %s: %v", p.peer.config.Name, err)
+			p.close()
+			return
 		}
 	}
 }
 func (r *Runtime) readRelayLoop(ctx context.Context, p *peerPort) {
 	for {
-		packet, err := p.conn.ReceiveTimeout(time.Second)
+		frame, err := p.conn.ReceiveTimeout(time.Second)
 		if err != nil {
 			var re *turntf.RelayError
 			if errors.As(err, &re) && re.Code == turntf.RelayErrorReceiveTimeout {
@@ -222,12 +256,11 @@ func (r *Runtime) readRelayLoop(ctx context.Context, p *peerPort) {
 			p.close()
 			return
 		}
-		if len(packet) == 0 || len(packet) > r.cfg.Transport.MaxPacketBytes {
-			continue
-		}
-		r.writeMu.Lock()
-		err = r.device.WritePacket(packet)
-		r.writeMu.Unlock()
+		err = decodeTunBatch(frame, r.cfg.Transport.MaxPacketBytes, func(packet []byte) error {
+			r.writeMu.Lock()
+			defer r.writeMu.Unlock()
+			return r.device.WritePacket(packet)
+		})
 		if err != nil {
 			if ctx.Err() == nil {
 				r.logf("write tun from %s: %v", p.peer.config.Name, err)
