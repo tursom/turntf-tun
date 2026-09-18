@@ -24,15 +24,15 @@ transport:
 peers:
   - name: "kr"
     user:
-      node_id: 0 # replace with the real turntf-tun-kr node_id
-      user_id: 0 # replace with the real turntf-tun-kr user_id
+      node_id: 54064871525449607 # turntf-tun-kr node_id
+      user_id: 1032 # turntf-tun-kr user_id
     routes:
       - "10.250.0.1/32"
     dial_policy: "auto"
   - name: "kiwi"
     user:
-      node_id: 0 # replace with the real turntf-tun-kiwi node_id
-      user_id: 0 # replace with the real turntf-tun-kiwi user_id
+      node_id: 54064871525449607 # turntf-tun-kiwi node_id
+      user_id: 1034 # turntf-tun-kiwi user_id
     routes:
       - "10.250.0.3/32"
     dial_policy: "auto"
