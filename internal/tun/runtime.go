@@ -11,7 +11,7 @@ import (
 )
 
 const relaySendBufferBytes = 8 << 20
-const relayWindowSize = 64
+const relayWindowSize = 32
 
 type Logger interface{ Printf(string, ...any) }
 
