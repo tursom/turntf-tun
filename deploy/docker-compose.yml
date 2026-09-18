@@ -1,0 +1,18 @@
+services:
+  turntf-tun:
+    image: ${IMAGE_REF:?set IMAGE_REF to an immutable turntf-tun image reference}
+    container_name: turntf-tun
+    restart: unless-stopped
+    network_mode: host
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - ./config.yaml:/etc/turntf/config.yaml:ro
+    command:
+      - run
+      - -c
+      - /etc/turntf/config.yaml

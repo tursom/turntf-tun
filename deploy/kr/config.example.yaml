@@ -1,0 +1,38 @@
+# Copy to /opt/turntf/tun/config.yaml on kr, then replace every REPLACE_* value.
+turntf:
+  base_url: "https://krntf.tursom.dev"
+  request_timeout: "10s"
+  ping_interval: "30s"
+  credentials:
+    login_name: "turntf-tun-kr"
+    password:
+      source: "plain"
+      value: "REPLACE_WITH_KR_TUN_PASSWORD"
+
+tun:
+  name: "turntf0"
+  mtu: 1400
+  addresses:
+    - "10.250.0.1/24"
+  bring_up: true
+
+transport:
+  send_queue_size: 4096
+  max_packet_bytes: 65535
+  dial_retry_interval: "3s"
+
+peers:
+  - name: "cc"
+    user:
+      node_id: 0 # replace with the real turntf-tun-cc node_id
+      user_id: 0 # replace with the real turntf-tun-cc user_id
+    routes:
+      - "10.250.0.2/32"
+    dial_policy: "auto"
+  - name: "kiwi"
+    user:
+      node_id: 0 # replace with the real turntf-tun-kiwi node_id
+      user_id: 0 # replace with the real turntf-tun-kiwi user_id
+    routes:
+      - "10.250.0.3/32"
+    dial_policy: "auto"
