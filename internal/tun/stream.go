@@ -3,9 +3,12 @@ package tun
 import (
 	"context"
 	"sync"
+	"time"
 
 	turntf "github.com/tursom/turntf-go"
 )
+
+const streamOpenTimeout = 5 * time.Second
 
 type streamPort struct {
 	runtime       *Runtime
@@ -13,6 +16,9 @@ type streamPort struct {
 	targetSession turntf.SessionRef
 	sender        *turntf.StreamSenderState
 	queue         chan []byte
+	ready         chan struct{}
+	readyOnce     sync.Once
+	openErr       chan error
 	done          chan struct{}
 	once          sync.Once
 }
@@ -24,6 +30,14 @@ func (p *streamPort) enqueue(packet []byte) bool {
 	default:
 		return false
 	}
+}
+func (p *streamPort) markReady(err error) {
+	p.readyOnce.Do(func() {
+		if err != nil {
+			p.openErr <- err
+		}
+		close(p.ready)
+	})
 }
 func (p *streamPort) close() { p.once.Do(func() { close(p.done) }) }
 
@@ -52,7 +66,7 @@ func (r *Runtime) streamLoop(ctx context.Context, peer PeerConfig) {
 		r.fallbackRelay(ctx, peer)
 		return
 	}
-	port := &streamPort{runtime: r, peer: target, targetSession: targetSession, sender: turntf.NewStreamSenderState(id, 1, turntf.DefaultStreamWindow), queue: make(chan []byte, r.cfg.Transport.SendQueueSize), done: make(chan struct{})}
+	port := &streamPort{runtime: r, peer: target, targetSession: targetSession, sender: turntf.NewStreamSenderState(id, 1, turntf.DefaultStreamWindow), queue: make(chan []byte, r.cfg.Transport.SendQueueSize), done: make(chan struct{}), ready: make(chan struct{}), openErr: make(chan error, 1)}
 	r.streamMu.Lock()
 	old := r.streamPorts[target]
 	r.streamPorts[target] = port
@@ -64,6 +78,19 @@ func (r *Runtime) streamLoop(ctx context.Context, peer PeerConfig) {
 	if _, err := r.client.SendStreamFrame(ctx, target, targetSession, open, turntf.DeliveryModeRouteRetry); err != nil {
 		port.close()
 		r.fallbackRelay(ctx, peer)
+		return
+	}
+	select {
+	case <-port.openErr:
+		port.close()
+		r.fallbackRelay(ctx, peer)
+		return
+	case <-time.After(streamOpenTimeout):
+		port.close()
+		r.fallbackRelay(ctx, peer)
+		return
+	case <-port.ready:
+	case <-ctx.Done():
 		return
 	}
 	go r.writeStreamLoop(port)
@@ -103,8 +130,9 @@ func (r *Runtime) fallbackRelay(ctx context.Context, peer PeerConfig) {
 }
 
 type streamReceiver struct {
-	peer  turntf.UserRef
-	state *turntf.StreamReceiverState
+	peer          turntf.UserRef
+	targetSession turntf.SessionRef
+	state         *turntf.StreamReceiverState
 }
 
 type runtimeHandler struct{ runtime *Runtime }
@@ -122,10 +150,22 @@ func (h runtimeHandler) OnStream(ctx context.Context, packet turntf.Packet, fram
 	switch frame.Kind {
 	case turntf.StreamFrameOpen:
 		r.streamMu.Lock()
-		r.streamRecv[frame.ID] = &streamReceiver{peer: packet.Sender, state: turntf.NewStreamReceiverState(frame.ID, frame.Epoch, frame.Window)}
+		receiver := r.streamRecv[frame.ID]
+		if receiver == nil {
+			receiver = &streamReceiver{peer: packet.Sender, targetSession: packet.TargetSession, state: turntf.NewStreamReceiverState(frame.ID, frame.Epoch, frame.Window)}
+			r.streamRecv[frame.ID] = receiver
+		}
 		r.streamMu.Unlock()
 		ack := turntf.StreamFrame{Kind: turntf.StreamFrameOpenAck, ID: frame.ID, Epoch: frame.Epoch, Window: frame.Window}
-		_, _ = r.client.SendStreamFrame(ctx, packet.Sender, turntf.SessionRef{}, ack, turntf.DeliveryModeRouteRetry)
+		_, _ = r.client.SendStreamFrame(ctx, packet.Sender, packet.TargetSession, ack, turntf.DeliveryModeRouteRetry)
+	case turntf.StreamFrameOpenAck:
+		r.streamMu.RLock()
+		port := r.streamPorts[packet.Sender]
+		r.streamMu.RUnlock()
+		if port != nil {
+			port.targetSession = packet.TargetSession
+			port.markReady(nil)
+		}
 	case turntf.StreamFrameData:
 		r.streamMu.RLock()
 		receiver := r.streamRecv[frame.ID]
@@ -142,7 +182,7 @@ func (h runtimeHandler) OnStream(ctx context.Context, packet turntf.Packet, fram
 			_ = r.device.WritePacket(payload)
 			r.writeMu.Unlock()
 		}
-		_, _ = r.client.SendStreamFrame(ctx, receiver.peer, turntf.SessionRef{}, ack, turntf.DeliveryModeRouteRetry)
+		_, _ = r.client.SendStreamFrame(ctx, receiver.peer, receiver.targetSession, ack, turntf.DeliveryModeRouteRetry)
 	case turntf.StreamFrameAck:
 		r.streamMu.RLock()
 		port := r.streamPorts[packet.Sender]
@@ -156,7 +196,7 @@ func (h runtimeHandler) OnStream(ctx context.Context, packet turntf.Packet, fram
 		r.streamMu.RUnlock()
 		if receiver != nil {
 			if ack, err := receiver.state.Resume(frame.Epoch, frame.Offset); err == nil {
-				_, _ = r.client.SendStreamFrame(ctx, receiver.peer, turntf.SessionRef{}, ack, turntf.DeliveryModeRouteRetry)
+				_, _ = r.client.SendStreamFrame(ctx, receiver.peer, receiver.targetSession, ack, turntf.DeliveryModeRouteRetry)
 			}
 		}
 	case turntf.StreamFrameClose:
