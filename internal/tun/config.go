@@ -33,7 +33,7 @@ transport:
   send_queue_size: 4096
   max_packet_bytes: 65535
   dial_retry_interval: "3s"
-
+  relay_window_size: 32
 peers:
   - name: "cc"
     user:
@@ -110,6 +110,7 @@ type TransportConfig struct {
 	SendQueueSize     int      `yaml:"send_queue_size"`
 	MaxPacketBytes    int      `yaml:"max_packet_bytes"`
 	DialRetryInterval Duration `yaml:"dial_retry_interval"`
+	RelayWindowSize   int      `yaml:"relay_window_size"`
 }
 type PeerConfig struct {
 	Name       string        `yaml:"name"`
@@ -162,6 +163,9 @@ func (c *Config) ApplyDefaults() {
 	if c.Transport.DialRetryInterval.Duration == 0 {
 		c.Transport.DialRetryInterval.Duration = 3 * time.Second
 	}
+	if c.Transport.RelayWindowSize == 0 {
+		c.Transport.RelayWindowSize = 32
+	}
 	for i := range c.Peers {
 		if c.Peers[i].DialPolicy == "" {
 			c.Peers[i].DialPolicy = "auto"
@@ -198,6 +202,9 @@ func (c Config) Validate() error {
 	}
 	if c.Transport.DialRetryInterval.Duration <= 0 {
 		return errors.New("transport.dial_retry_interval must be positive")
+	}
+	if c.Transport.RelayWindowSize < 1 || c.Transport.RelayWindowSize > 256 {
+		return errors.New("transport.relay_window_size must be between 1 and 256")
 	}
 	for _, a := range c.Tun.Addresses {
 		if _, _, err := net.ParseCIDR(a); err != nil {

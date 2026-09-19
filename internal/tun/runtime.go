@@ -11,7 +11,6 @@ import (
 )
 
 const relaySendBufferBytes = 8 << 20
-const relayWindowSize = 32
 
 type Logger interface{ Printf(string, ...any) }
 
@@ -115,7 +114,7 @@ func NewRuntime(cfg Config, device PacketDevice, routes *routeTable, logger Logg
 	relayCfg := turntf.DefaultRelayConfig()
 	relayCfg.Reliability = turntf.ReliabilityAtLeastOnce
 	relayCfg.DeliveryMode = turntf.DeliveryModeBestEffort
-	relayCfg.WindowSize = relayWindowSize
+	relayCfg.WindowSize = cfg.Transport.RelayWindowSize
 	relayCfg.SendBufferSize = relaySendBufferBytes
 	return &Runtime{cfg: cfg, logger: logger, device: device, client: client, relay: client.Relay(), relayCfg: relayCfg, routes: routes, ports: make(map[turntf.UserRef]*peerPort)}, nil
 }
