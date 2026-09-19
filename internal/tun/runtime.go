@@ -144,13 +144,15 @@ func (r *Runtime) Run(ctx context.Context) error {
 	go func() { defer wg.Done(); r.readTUNLoop(ctx) }()
 	for i := range r.cfg.Peers {
 		p := r.cfg.Peers[i]
-		if shouldDial(localUser, p.User.ToTurntf(), p.DialPolicy) {
+		if r.cfg.Transport.Mode == "stream" {
+			// Stream offsets are unidirectional. Each peer owns one outbound
+			// logical stream so TUN request and response packets have independent
+			// ACK/window/Resume state.
 			wg.Add(1)
-			if r.cfg.Transport.Mode == "stream" {
-				go func() { defer wg.Done(); r.streamLoop(ctx, p) }()
-			} else {
-				go func() { defer wg.Done(); r.dialLoop(ctx, p) }()
-			}
+			go func() { defer wg.Done(); r.streamLoop(ctx, p) }()
+		} else if shouldDial(localUser, p.User.ToTurntf(), p.DialPolicy) {
+			wg.Add(1)
+			go func() { defer wg.Done(); r.dialLoop(ctx, p) }()
 		}
 	}
 	<-ctx.Done()
