@@ -30,6 +30,7 @@ tun:
   bring_up: true
 
 transport:
+  mode: "auto"
   send_queue_size: 4096
   max_packet_bytes: 65535
   dial_retry_interval: "3s"
@@ -107,6 +108,7 @@ type TunConfig struct {
 	BringUp   bool     `yaml:"bring_up"`
 }
 type TransportConfig struct {
+	Mode              string   `yaml:"mode"`
 	SendQueueSize     int      `yaml:"send_queue_size"`
 	MaxPacketBytes    int      `yaml:"max_packet_bytes"`
 	DialRetryInterval Duration `yaml:"dial_retry_interval"`
@@ -139,6 +141,9 @@ func LoadConfig(path string) (Config, error) {
 	return c, nil
 }
 func (c *Config) ApplyDefaults() {
+	if c.Transport.Mode == "" {
+		c.Transport.Mode = "auto"
+	}
 	if c.Turntf.RequestTimeout.Duration == 0 {
 		c.Turntf.RequestTimeout.Duration = 10 * time.Second
 	}
@@ -193,6 +198,9 @@ func (c Config) Validate() error {
 
 	if c.Tun.MTU < 576 || c.Tun.MTU > 65535 {
 		return errors.New("tun.mtu must be between 576 and 65535")
+	}
+	if c.Transport.Mode != "auto" && c.Transport.Mode != "stream" && c.Transport.Mode != "relay" {
+		return errors.New("transport.mode must be auto, stream or relay")
 	}
 	if c.Transport.SendQueueSize < 1 {
 		return errors.New("transport.send_queue_size must be positive")
