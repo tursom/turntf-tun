@@ -91,7 +91,7 @@ func TestStreamLoopRetriesAfterFallbackAndActivatesStream(t *testing.T) {
 		runtimeHandler{runtime: r}.OnStream(ctx, turntf.Packet{Sender: peerRef, TargetSession: session}, turntf.StreamFrame{Kind: turntf.StreamFrameOpenAck, ID: frame.ID, Epoch: frame.Epoch, Window: frame.Window})
 		return turntf.RelayAccepted{}, nil
 	}
-	r.fallbackDial = func(ctx context.Context, _ PeerConfig) {
+	r.relayDial = func(ctx context.Context, _ PeerConfig) {
 		dialCount.Add(1)
 		port := &peerPort{queue: make(chan []byte, 1), done: make(chan struct{})}
 		r.mu.Lock()
@@ -142,7 +142,7 @@ func TestStreamLoopNonDialSideOnlyRetriesStream(t *testing.T) {
 	var openCount atomic.Int32
 	var dialCount atomic.Int32
 	r := failingStreamRuntime(peerRef, turntf.UserRef{NodeID: 9, UserID: 1}, &openCount)
-	r.fallbackDial = func(context.Context, PeerConfig) { dialCount.Add(1) }
+	r.relayDial = func(context.Context, PeerConfig) { dialCount.Add(1) }
 
 	ctx, cancel := context.WithCancel(context.Background())
 	loopDone := make(chan struct{})
@@ -166,7 +166,7 @@ func TestStreamLoopRepeatedFailuresKeepSingleFallbackDial(t *testing.T) {
 	var activeDials atomic.Int32
 	var maxActiveDials atomic.Int32
 	r := failingStreamRuntime(peerRef, turntf.UserRef{NodeID: 1, UserID: 1}, &openCount)
-	r.fallbackDial = func(ctx context.Context, _ PeerConfig) {
+	r.relayDial = func(ctx context.Context, _ PeerConfig) {
 		dialCount.Add(1)
 		active := activeDials.Add(1)
 		for {

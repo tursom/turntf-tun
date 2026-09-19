@@ -59,7 +59,7 @@ type Runtime struct {
 	streamResolve func(context.Context, turntf.UserRef) (turntf.ResolvedUserSessions, error)
 	streamSend    func(context.Context, turntf.UserRef, turntf.SessionRef, turntf.StreamFrame, turntf.DeliveryMode) (turntf.RelayAccepted, error)
 	streamNewID   func() (turntf.StreamID, error)
-	fallbackDial  func(context.Context, PeerConfig)
+	relayDial     func(context.Context, PeerConfig)
 	localUser     turntf.UserRef
 	connected     bool
 	releaseLease  func(context.Context)
@@ -156,16 +156,11 @@ func (r *Runtime) Run(ctx context.Context) error {
 	go func() { defer wg.Done(); r.readTUNLoop(ctx) }()
 	for i := range r.cfg.Peers {
 		p := r.cfg.Peers[i]
-		if r.cfg.Transport.Mode == "stream" {
-			// Stream offsets are unidirectional. Each peer owns one outbound
-			// logical stream so TUN request and response packets have independent
-			// ACK/window/Resume state.
-			wg.Add(1)
-			go func() { defer wg.Done(); r.streamLoop(ctx, p) }()
-		} else if shouldDial(localUser, p.User.ToTurntf(), p.DialPolicy) {
-			wg.Add(1)
-			go func() { defer wg.Done(); r.dialLoop(ctx, p) }()
-		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r.runPeer(ctx, localUser, p)
+		}()
 	}
 	<-ctx.Done()
 	_ = r.device.Close()
@@ -173,6 +168,28 @@ func (r *Runtime) Run(ctx context.Context) error {
 	wg.Wait()
 	return nil
 }
+
+func (r *Runtime) runPeer(ctx context.Context, localUser turntf.UserRef, peer PeerConfig) {
+	if peer.effectiveTransportMode(r.cfg.Transport.Mode) == "stream" {
+		// Stream offsets are unidirectional. Each peer owns one outbound
+		// logical stream so TUN request and response packets have independent
+		// ACK/window/Resume state.
+		r.streamLoop(ctx, peer)
+		return
+	}
+	if shouldDial(localUser, peer.User.ToTurntf(), peer.DialPolicy) {
+		r.dialPeer(ctx, peer)
+	}
+}
+
+func (r *Runtime) dialPeer(ctx context.Context, peer PeerConfig) {
+	if r.relayDial != nil {
+		r.relayDial(ctx, peer)
+		return
+	}
+	r.dialLoop(ctx, peer)
+}
+
 func (r *Runtime) readTUNLoop(ctx context.Context) {
 	for ctx.Err() == nil {
 		packet, err := r.device.ReadPacket(ctx)

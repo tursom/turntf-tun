@@ -272,11 +272,7 @@ func (r *Runtime) streamLoop(ctx context.Context, peer PeerConfig) {
 		fallbackDone = make(chan struct{})
 		go func(done chan struct{}) {
 			defer close(done)
-			if r.fallbackDial != nil {
-				r.fallbackDial(fallbackCtx, peer)
-				return
-			}
-			r.dialLoop(fallbackCtx, peer)
+			r.dialPeer(fallbackCtx, peer)
 		}(fallbackDone)
 	}
 	stopFallback := func() {

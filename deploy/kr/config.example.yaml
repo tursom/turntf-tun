@@ -17,6 +17,7 @@ tun:
   bring_up: true
 
 transport:
+  mode: "auto"
   send_queue_size: 4096
   max_packet_bytes: 65535
   dial_retry_interval: "3s"

@@ -42,6 +42,7 @@ peers:
       user_id: 1026
     routes:
       - "10.250.0.2/32"
+    transport_mode: "stream"
     dial_policy: "auto"
   - name: "kiwi"
     user:
@@ -115,10 +116,11 @@ type TransportConfig struct {
 	RelayWindowSize   int      `yaml:"relay_window_size"`
 }
 type PeerConfig struct {
-	Name       string        `yaml:"name"`
-	User       UserRefConfig `yaml:"user"`
-	Routes     []string      `yaml:"routes"`
-	DialPolicy string        `yaml:"dial_policy"`
+	Name          string        `yaml:"name"`
+	User          UserRefConfig `yaml:"user"`
+	Routes        []string      `yaml:"routes"`
+	TransportMode string        `yaml:"transport_mode"`
+	DialPolicy    string        `yaml:"dial_policy"`
 }
 type UserRefConfig struct {
 	NodeID int64 `yaml:"node_id"`
@@ -199,7 +201,7 @@ func (c Config) Validate() error {
 	if c.Tun.MTU < 576 || c.Tun.MTU > 65535 {
 		return errors.New("tun.mtu must be between 576 and 65535")
 	}
-	if c.Transport.Mode != "auto" && c.Transport.Mode != "stream" && c.Transport.Mode != "relay" {
+	if !validTransportMode(c.Transport.Mode) {
 		return errors.New("transport.mode must be auto, stream or relay")
 	}
 	if c.Transport.SendQueueSize < 1 {
@@ -232,6 +234,9 @@ func (c Config) Validate() error {
 			return fmt.Errorf("duplicate peer user %d:%d", u.NodeID, u.UserID)
 		}
 		seen[u] = true
+		if p.TransportMode != "" && !validTransportMode(p.TransportMode) {
+			return fmt.Errorf("peers[%d].transport_mode must be auto, stream or relay", i)
+		}
 		if p.DialPolicy != "auto" && p.DialPolicy != "always" && p.DialPolicy != "never" {
 			return fmt.Errorf("peers[%d].dial_policy must be auto, always or never", i)
 		}
@@ -246,6 +251,18 @@ func (c Config) Validate() error {
 	}
 	return nil
 }
+
+func validTransportMode(mode string) bool {
+	return mode == "auto" || mode == "stream" || mode == "relay"
+}
+
+func (p PeerConfig) effectiveTransportMode(globalMode string) string {
+	if p.TransportMode != "" {
+		return p.TransportMode
+	}
+	return globalMode
+}
+
 func (c CredentialsConfig) ToTurntf() (turntf.Credentials, error) {
 	p, err := c.Password.ToTurntf()
 	if err != nil {

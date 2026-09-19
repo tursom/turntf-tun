@@ -8,7 +8,7 @@
 - 每个 peer 配置明确的 CIDR 路由，支持 IPv4 和 IPv6。
 - Relay 使用 `at_least_once`，并在每个 peer 上把 IP packet 聚合成最多 128 KiB 的 batch；acceptance RPC 有界并行，避免高 RTT 链路上逐包等待，同时不引入可靠有序重排。IP 层上面的 TCP/UDP 仍负责自己的语义。
 - 每个 peer 有界发送队列；队列满时丢包，TUN 读循环不会等待慢 Relay。
-- 每个 peer 使用独立的 Relay 连接和收发循环，单个出口拥塞不会阻塞其他 peer。
+- 每个 peer 使用独立的数据面状态；可通过 `peers[].transport_mode` 在同一进程内混用 Relay 和 stream，单个 peer 的 stream 建连、重试或拥塞不会切换其他 peer 的传输模式。
 - TUN MTU 应按实际出口和 turntf 封装开销选择。默认 `1400`，部署后可通过吞吐、丢包和长尾测试调整。
 
 这不是二层交换机，不提供 ARP、广播、组播泛洪、NAT 或真实 LAN 网段转发。需要二层互通时使用 `turntf-tap-switch`。
@@ -108,6 +108,28 @@ peers:
 ```
 
 cc 和 kiwi 使用对应的本地地址和 peer 路由。三台节点应互相列入 `peers`，并为三台节点分别配置唯一的 turntf 用户。
+
+## 逐 peer 传输模式
+
+全局 `transport.mode` 和可选的 `peers[].transport_mode` 都接受 `auto`、`relay`、`stream`。peer 未设置 `transport_mode` 时继承全局值；显式设置时只覆盖该 peer。`auto` 保持原有 Relay 建连规则，由 `dial_policy` 和双方 user ref 决定拨号侧；`relay` 同样使用该 Relay 路径；只有 effective mode 为 `stream` 的 peer 才启动 stream lifecycle，并在 stream 不可用时按 `dial_retry_interval` 重试及按 `dial_policy` 建立 Relay fallback。
+
+```yaml
+transport:
+  mode: "relay"
+peers:
+  - name: "cc"
+    user: {node_id: 1, user_id: 2}
+    routes: ["10.250.0.2/32"]
+    transport_mode: "stream"
+    dial_policy: "auto"
+  - name: "kiwi"
+    user: {node_id: 1, user_id: 3}
+    routes: ["10.250.0.3/32"]
+    # transport_mode 省略，继承全局 relay
+    dial_policy: "auto"
+```
+
+stream 激活后的出口优先级也按 peer 隔离：只有目标 peer 已激活 stream 时才走 stream，其他 peer 继续使用各自的 Relay 连接。详细协议与 fallback 行为见 [`docs/stream-mode.md`](docs/stream-mode.md)。
 
 ## 性能边界
 
