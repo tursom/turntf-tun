@@ -33,13 +33,18 @@ func encodeStreamBatch(first []byte, queue <-chan []byte) []byte {
 	if !appendPacket(first) {
 		return first
 	}
+	timer := time.NewTimer(streamBatchWait)
+	defer timer.Stop()
 	for {
 		select {
 		case packet := <-queue:
 			if !appendPacket(packet) {
 				return batch
 			}
-		default:
+			if len(batch) >= streamBatchMax-2048 {
+				return batch
+			}
+		case <-timer.C:
 			return batch
 		}
 	}
