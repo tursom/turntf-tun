@@ -24,7 +24,12 @@ type peerPort struct {
 }
 
 func (p *peerPort) close() {
-	p.once.Do(func() { close(p.done); p.conn.Abort(errors.New("replaced or closed")) })
+	p.once.Do(func() {
+		close(p.done)
+		if p.conn != nil {
+			p.conn.Abort(errors.New("replaced or closed"))
+		}
+	})
 }
 func (p *peerPort) enqueue(packet []byte) bool {
 	packet = append([]byte(nil), packet...)
@@ -46,6 +51,7 @@ type Runtime struct {
 	routes        *routeTable
 	mu            sync.RWMutex
 	ports         map[turntf.UserRef]*peerPort
+	activeStreams map[turntf.UserRef]*streamPort
 	writeMu       sync.Mutex
 	streamMu      sync.RWMutex
 	streamPorts   map[turntf.UserRef]*streamPort
@@ -53,6 +59,8 @@ type Runtime struct {
 	streamResolve func(context.Context, turntf.UserRef) (turntf.ResolvedUserSessions, error)
 	streamSend    func(context.Context, turntf.UserRef, turntf.SessionRef, turntf.StreamFrame, turntf.DeliveryMode) (turntf.RelayAccepted, error)
 	streamNewID   func() (turntf.StreamID, error)
+	fallbackDial  func(context.Context, PeerConfig)
+	localUser     turntf.UserRef
 	connected     bool
 	releaseLease  func(context.Context)
 }
@@ -118,7 +126,7 @@ func NewRuntime(cfg Config, device PacketDevice, routes *routeTable, logger Logg
 	relayCfg.DeliveryMode = turntf.DeliveryModeBestEffort
 	relayCfg.WindowSize = cfg.Transport.RelayWindowSize
 	relayCfg.SendBufferSize = relaySendBufferBytes
-	rt := &Runtime{cfg: cfg, logger: logger, device: device, routes: routes, relayCfg: relayCfg, ports: make(map[turntf.UserRef]*peerPort), streamPorts: make(map[turntf.UserRef]*streamPort), streamRecv: make(map[turntf.StreamID]*streamReceiver)}
+	rt := &Runtime{cfg: cfg, logger: logger, device: device, routes: routes, relayCfg: relayCfg, ports: make(map[turntf.UserRef]*peerPort), activeStreams: make(map[turntf.UserRef]*streamPort), streamPorts: make(map[turntf.UserRef]*streamPort), streamRecv: make(map[turntf.StreamID]*streamReceiver)}
 	client, err := turntf.NewClient(turntf.Config{BaseURL: cfg.Turntf.BaseURL, Credentials: credentials, CursorStore: turntf.NewMemoryCursorStore(), Handler: runtimeHandler{runtime: rt}, RequestTimeout: cfg.Turntf.RequestTimeout.Duration, PingInterval: cfg.Turntf.PingInterval.Duration, TransientOnly: true, RealtimeStream: true})
 	if err != nil {
 		return nil, err
@@ -142,6 +150,7 @@ func (r *Runtime) Run(ctx context.Context) error {
 	}
 	r.logf("connected as %d:%d", login.User.NodeID, login.User.UserID)
 	localUser := turntf.UserRef{NodeID: login.User.NodeID, UserID: login.User.UserID}
+	r.localUser = localUser
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() { defer wg.Done(); r.readTUNLoop(ctx) }()
@@ -180,20 +189,18 @@ func (r *Runtime) readTUNLoop(ctx context.Context) {
 		if peer == nil {
 			continue
 		}
+		user := peer.config.User.ToTurntf()
 		r.mu.RLock()
-		port := r.ports[peer.config.User.ToTurntf()]
+		stream := r.activeStreams[user]
+		port := r.ports[user]
 		r.mu.RUnlock()
-		if port != nil {
-			port.enqueue(packet)
-			continue
-		}
-		r.streamMu.RLock()
-		stream := r.streamPorts[peer.config.User.ToTurntf()]
-		r.streamMu.RUnlock()
 		if stream != nil {
 			stream.enqueue(packet)
+			continue
 		}
-		continue
+		if port != nil {
+			port.enqueue(packet)
+		}
 	}
 }
 func (r *Runtime) dialLoop(ctx context.Context, peer PeerConfig) {
@@ -235,6 +242,11 @@ func (r *Runtime) registerPort(ctx context.Context, peer PeerConfig, conn *turnt
 	p := &peerPort{peer: &peerConfig{config: &peer}, conn: conn, queue: make(chan []byte, r.cfg.Transport.SendQueueSize), done: make(chan struct{})}
 	user := peer.User.ToTurntf()
 	r.mu.Lock()
+	if r.activeStreams[user] != nil {
+		r.mu.Unlock()
+		p.close()
+		return p
+	}
 	old := r.ports[user]
 	r.ports[user] = p
 	r.mu.Unlock()

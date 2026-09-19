@@ -2,7 +2,9 @@ package tun
 
 import (
 	"context"
+	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -57,6 +59,192 @@ func TestStreamBatchRejectsMalformedPayload(t *testing.T) {
 		t.Fatalf("malformed batch decoded as (%v, %v)", packets, ok)
 	}
 }
+func TestStreamLoopRetriesAfterFallbackAndActivatesStream(t *testing.T) {
+	peerRef := turntf.UserRef{NodeID: 2, UserID: 3}
+	peer := PeerConfig{Name: "peer", User: UserRefConfig{NodeID: peerRef.NodeID, UserID: peerRef.UserID}}
+	session := turntf.SessionRef{ServingNodeID: 4, SessionID: "session"}
+	var openCount atomic.Int32
+	var idCount atomic.Uint32
+	var dialCount atomic.Int32
+	fallbackStarted := make(chan *peerPort, 1)
+	r := &Runtime{
+		cfg:           Config{Transport: TransportConfig{SendQueueSize: 4, DialRetryInterval: Duration{Duration: 10 * time.Millisecond}}},
+		ports:         make(map[turntf.UserRef]*peerPort),
+		activeStreams: make(map[turntf.UserRef]*streamPort),
+		streamPorts:   make(map[turntf.UserRef]*streamPort),
+		streamRecv:    make(map[turntf.StreamID]*streamReceiver),
+		localUser:     turntf.UserRef{NodeID: 1, UserID: 1},
+		streamResolve: func(context.Context, turntf.UserRef) (turntf.ResolvedUserSessions, error) {
+			return turntf.ResolvedUserSessions{Sessions: []turntf.ResolvedSession{{Session: session, TransientCapable: true}}}, nil
+		},
+		streamNewID: func() (turntf.StreamID, error) {
+			return turntf.StreamID{byte(idCount.Add(1))}, nil
+		},
+	}
+	r.streamSend = func(ctx context.Context, _ turntf.UserRef, _ turntf.SessionRef, frame turntf.StreamFrame, _ turntf.DeliveryMode) (turntf.RelayAccepted, error) {
+		if frame.Kind != turntf.StreamFrameOpen {
+			return turntf.RelayAccepted{}, nil
+		}
+		if openCount.Add(1) == 1 {
+			return turntf.RelayAccepted{}, errors.New("initial open failed")
+		}
+		runtimeHandler{runtime: r}.OnStream(ctx, turntf.Packet{Sender: peerRef, TargetSession: session}, turntf.StreamFrame{Kind: turntf.StreamFrameOpenAck, ID: frame.ID, Epoch: frame.Epoch, Window: frame.Window})
+		return turntf.RelayAccepted{}, nil
+	}
+	r.fallbackDial = func(ctx context.Context, _ PeerConfig) {
+		dialCount.Add(1)
+		port := &peerPort{queue: make(chan []byte, 1), done: make(chan struct{})}
+		r.mu.Lock()
+		if r.activeStreams[peerRef] == nil {
+			r.ports[peerRef] = port
+		}
+		r.mu.Unlock()
+		fallbackStarted <- port
+		select {
+		case <-ctx.Done():
+			port.close()
+		case <-port.done:
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	loopDone := make(chan struct{})
+	go func() {
+		r.streamLoop(ctx, peer)
+		close(loopDone)
+	}()
+	fallbackPort := <-fallbackStarted
+	waitForCondition(t, func() bool {
+		r.mu.RLock()
+		active := r.activeStreams[peerRef]
+		relay := r.ports[peerRef]
+		r.mu.RUnlock()
+		r.streamMu.RLock()
+		registered := r.streamPorts[peerRef]
+		r.streamMu.RUnlock()
+		return openCount.Load() >= 2 && active != nil && active == registered && relay == nil
+	}, "stream did not replace fallback relay")
+	select {
+	case <-fallbackPort.done:
+	default:
+		t.Fatal("fallback relay was not closed after stream activation")
+	}
+	if got := dialCount.Load(); got != 1 {
+		t.Fatalf("fallback dial count = %d, want 1", got)
+	}
+	cancel()
+	waitForDone(t, loopDone, "stream lifecycle did not stop")
+}
+
+func TestStreamLoopNonDialSideOnlyRetriesStream(t *testing.T) {
+	peerRef := turntf.UserRef{NodeID: 2, UserID: 3}
+	peer := PeerConfig{Name: "peer", User: UserRefConfig{NodeID: peerRef.NodeID, UserID: peerRef.UserID}}
+	var openCount atomic.Int32
+	var dialCount atomic.Int32
+	r := failingStreamRuntime(peerRef, turntf.UserRef{NodeID: 9, UserID: 1}, &openCount)
+	r.fallbackDial = func(context.Context, PeerConfig) { dialCount.Add(1) }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	loopDone := make(chan struct{})
+	go func() {
+		r.streamLoop(ctx, peer)
+		close(loopDone)
+	}()
+	waitForCondition(t, func() bool { return openCount.Load() >= 3 }, "non-dial side did not retry stream")
+	cancel()
+	waitForDone(t, loopDone, "non-dial stream lifecycle did not stop")
+	if got := dialCount.Load(); got != 0 {
+		t.Fatalf("fallback dial count = %d, want 0", got)
+	}
+}
+
+func TestStreamLoopRepeatedFailuresKeepSingleFallbackDial(t *testing.T) {
+	peerRef := turntf.UserRef{NodeID: 2, UserID: 3}
+	peer := PeerConfig{Name: "peer", User: UserRefConfig{NodeID: peerRef.NodeID, UserID: peerRef.UserID}}
+	var openCount atomic.Int32
+	var dialCount atomic.Int32
+	var activeDials atomic.Int32
+	var maxActiveDials atomic.Int32
+	r := failingStreamRuntime(peerRef, turntf.UserRef{NodeID: 1, UserID: 1}, &openCount)
+	r.fallbackDial = func(ctx context.Context, _ PeerConfig) {
+		dialCount.Add(1)
+		active := activeDials.Add(1)
+		for {
+			maximum := maxActiveDials.Load()
+			if active <= maximum || maxActiveDials.CompareAndSwap(maximum, active) {
+				break
+			}
+		}
+		<-ctx.Done()
+		activeDials.Add(-1)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	loopDone := make(chan struct{})
+	go func() {
+		r.streamLoop(ctx, peer)
+		close(loopDone)
+	}()
+	waitForCondition(t, func() bool { return openCount.Load() >= 4 }, "stream failures were not retried")
+	if got := dialCount.Load(); got != 1 {
+		t.Fatalf("fallback dial count = %d, want 1", got)
+	}
+	if got := maxActiveDials.Load(); got != 1 {
+		t.Fatalf("maximum concurrent fallback dials = %d, want 1", got)
+	}
+	cancel()
+	waitForDone(t, loopDone, "failing stream lifecycle did not stop")
+	if got := activeDials.Load(); got != 0 {
+		t.Fatalf("active fallback dials after cancellation = %d, want 0", got)
+	}
+}
+
+func failingStreamRuntime(peer, local turntf.UserRef, openCount *atomic.Int32) *Runtime {
+	session := turntf.SessionRef{ServingNodeID: 4, SessionID: "session"}
+	var idCount atomic.Uint32
+	return &Runtime{
+		cfg:           Config{Transport: TransportConfig{SendQueueSize: 4, DialRetryInterval: Duration{Duration: time.Millisecond}}},
+		ports:         make(map[turntf.UserRef]*peerPort),
+		activeStreams: make(map[turntf.UserRef]*streamPort),
+		streamPorts:   make(map[turntf.UserRef]*streamPort),
+		streamRecv:    make(map[turntf.StreamID]*streamReceiver),
+		localUser:     local,
+		streamResolve: func(context.Context, turntf.UserRef) (turntf.ResolvedUserSessions, error) {
+			return turntf.ResolvedUserSessions{Sessions: []turntf.ResolvedSession{{Session: session, TransientCapable: true}}}, nil
+		},
+		streamNewID: func() (turntf.StreamID, error) {
+			return turntf.StreamID{byte(idCount.Add(1))}, nil
+		},
+		streamSend: func(_ context.Context, _ turntf.UserRef, _ turntf.SessionRef, frame turntf.StreamFrame, _ turntf.DeliveryMode) (turntf.RelayAccepted, error) {
+			if frame.Kind == turntf.StreamFrameOpen {
+				openCount.Add(1)
+			}
+			return turntf.RelayAccepted{}, errors.New("open failed")
+		},
+	}
+}
+
+func waitForCondition(t *testing.T, condition func() bool, message string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal(message)
+}
+
+func waitForDone(t *testing.T, done <-chan struct{}, message string) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal(message)
+	}
+}
+
 func TestStreamPortResumeKeepsIDAndPendingSuffix(t *testing.T) {
 	p := testStreamPort()
 	if !p.enqueue([]byte("queued")) {
