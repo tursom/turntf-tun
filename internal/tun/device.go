@@ -20,6 +20,7 @@ type PacketDevice interface {
 type TUNDevice struct {
 	ifce           *water.Interface
 	maxPacketBytes int
+	readBuf        []byte
 }
 
 func OpenTUN(cfg TunConfig, maxPacketBytes int) (*TUNDevice, error) {
@@ -39,23 +40,19 @@ func OpenTUN(cfg TunConfig, maxPacketBytes int) (*TUNDevice, error) {
 }
 func (d *TUNDevice) Name() string { return d.ifce.Name() }
 func (d *TUNDevice) ReadPacket(ctx context.Context) ([]byte, error) {
-	buf := make([]byte, d.maxPacketBytes)
-	type result struct {
-		n   int
-		err error
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	ch := make(chan result, 1)
-	go func() { n, err := d.ifce.Read(buf); ch <- result{n, err} }()
-	select {
-	case <-ctx.Done():
-		_ = d.Close()
-		return nil, ctx.Err()
-	case r := <-ch:
-		if r.err != nil {
-			return nil, r.err
-		}
-		return append([]byte(nil), buf[:r.n]...), nil
+	buf := d.readBuf
+	if len(buf) != d.maxPacketBytes {
+		buf = make([]byte, d.maxPacketBytes)
+		d.readBuf = buf
 	}
+	n, err := d.ifce.Read(buf)
+	if err != nil {
+		return nil, err
+	}
+	return buf[:n], nil
 }
 func (d *TUNDevice) WritePacket(packet []byte) error { _, err := d.ifce.Write(packet); return err }
 func (d *TUNDevice) Close() error                    { return d.ifce.Close() }
