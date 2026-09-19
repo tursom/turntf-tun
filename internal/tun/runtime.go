@@ -37,21 +37,24 @@ func (p *peerPort) enqueue(packet []byte) bool {
 }
 
 type Runtime struct {
-	cfg          Config
-	logger       Logger
-	device       PacketDevice
-	client       *turntf.Client
-	relay        *turntf.Relay
-	relayCfg     turntf.RelayConfig
-	routes       *routeTable
-	mu           sync.RWMutex
-	ports        map[turntf.UserRef]*peerPort
-	writeMu      sync.Mutex
-	streamMu     sync.RWMutex
-	streamPorts  map[turntf.UserRef]*streamPort
-	streamRecv   map[turntf.StreamID]*streamReceiver
-	connected    bool
-	releaseLease func(context.Context)
+	cfg           Config
+	logger        Logger
+	device        PacketDevice
+	client        *turntf.Client
+	relay         *turntf.Relay
+	relayCfg      turntf.RelayConfig
+	routes        *routeTable
+	mu            sync.RWMutex
+	ports         map[turntf.UserRef]*peerPort
+	writeMu       sync.Mutex
+	streamMu      sync.RWMutex
+	streamPorts   map[turntf.UserRef]*streamPort
+	streamRecv    map[turntf.StreamID]*streamReceiver
+	streamResolve func(context.Context, turntf.UserRef) (turntf.ResolvedUserSessions, error)
+	streamSend    func(context.Context, turntf.UserRef, turntf.SessionRef, turntf.StreamFrame, turntf.DeliveryMode) (turntf.RelayAccepted, error)
+	streamNewID   func() (turntf.StreamID, error)
+	connected     bool
+	releaseLease  func(context.Context)
 }
 
 func Run(ctx context.Context, cfg Config, logger Logger) error {
