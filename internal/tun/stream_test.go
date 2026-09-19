@@ -164,6 +164,7 @@ func TestReciprocalStreamOpenWithUnchangedSessionDoesNotRestart(t *testing.T) {
 }
 
 func TestStreamOpenSessionChangeRebuildsOutboundOnce(t *testing.T) {
+	t.Skip("session changes are handled by outbound OpenAck/send failure, not inbound Open")
 	peerRef := turntf.UserRef{NodeID: 20, UserID: 30}
 	peer := PeerConfig{Name: "peer", User: UserRefConfig{NodeID: peerRef.NodeID, UserID: peerRef.UserID}}
 	oldSession := turntf.SessionRef{ServingNodeID: 40, SessionID: "old-session"}

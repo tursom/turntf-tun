@@ -485,12 +485,7 @@ func (h runtimeHandler) OnStream(ctx context.Context, packet turntf.Packet, fram
 			receiver = &streamReceiver{peer: packet.Sender, targetSession: packet.TargetSession, state: turntf.NewStreamReceiverState(frame.ID, frame.Epoch, frame.Window)}
 			r.streamRecv[frame.ID] = receiver
 		}
-		port := r.streamPorts[packet.Sender]
-		restart := port != nil && !packet.TargetSession.IsZero() && port.requestRestart(packet.TargetSession)
 		r.streamMu.Unlock()
-		if restart {
-			r.logf("stream peer %d:%d session changed; rebuilding outbound stream", packet.Sender.NodeID, packet.Sender.UserID)
-		}
 		ack := turntf.StreamFrame{Kind: turntf.StreamFrameOpenAck, ID: frame.ID, Epoch: frame.Epoch, Window: frame.Window}
 		_, _ = r.sendStreamFrame(ctx, packet.Sender, packet.TargetSession, ack)
 	case turntf.StreamFrameOpenAck:
