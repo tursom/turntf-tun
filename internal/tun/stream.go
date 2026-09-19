@@ -441,6 +441,14 @@ func (r *Runtime) writeStreamLoop(p *streamPort) {
 }
 
 func (r *Runtime) fallbackRelay(ctx context.Context, peer PeerConfig) {
+	login, ok := r.client.CurrentLogin()
+	if !ok {
+		return
+	}
+	local := turntf.UserRef{NodeID: login.User.NodeID, UserID: login.User.UserID}
+	if !shouldDial(local, peer.User.ToTurntf(), peer.DialPolicy) {
+		return
+	}
 	r.dialLoop(ctx, peer)
 }
 
