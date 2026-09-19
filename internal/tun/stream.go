@@ -17,7 +17,7 @@ const (
 
 var streamPacketMagic = [2]byte{0x54, 0x50}
 
-func encodeStreamBatch(first []byte, queue <-chan []byte) []byte {
+func encodeStreamBatch(first []byte, queue <-chan []byte) ([]byte, []byte) {
 	batch := make([]byte, 0, len(first)+8)
 	batch = append(batch, streamPacketMagic[:]...)
 	appendPacket := func(packet []byte) bool {
@@ -31,17 +31,17 @@ func encodeStreamBatch(first []byte, queue <-chan []byte) []byte {
 		return true
 	}
 	if !appendPacket(first) {
-		return first
+		return first, nil
 	}
 	if streamBatchWait <= 0 {
 		for {
 			select {
 			case packet := <-queue:
 				if !appendPacket(packet) {
-					return batch
+					return batch, packet
 				}
 			default:
-				return batch
+				return batch, nil
 			}
 		}
 	}
@@ -51,13 +51,13 @@ func encodeStreamBatch(first []byte, queue <-chan []byte) []byte {
 		select {
 		case packet := <-queue:
 			if !appendPacket(packet) {
-				return batch
+				return batch, packet
 			}
 			if len(batch) >= streamBatchMax-2048 {
-				return batch
+				return batch, nil
 			}
 		case <-timer.C:
-			return batch
+			return batch, nil
 		}
 	}
 }
@@ -398,6 +398,7 @@ func (r *Runtime) recoverStream(ctx context.Context, peer PeerConfig, p *streamP
 
 func (r *Runtime) writeStreamLoop(p *streamPort) {
 	var pending []byte
+	var overflow []byte
 	for {
 		session, ready := p.currentPath()
 		select {
@@ -409,12 +410,17 @@ func (r *Runtime) writeStreamLoop(p *streamPort) {
 			continue
 		}
 		if pending == nil {
-			select {
-			case <-p.done:
-				return
-			case first := <-p.queue:
-				pending = encodeStreamBatch(first, p.queue)
+			var first []byte
+			if overflow != nil {
+				first, overflow = overflow, nil
+			} else {
+				select {
+				case <-p.done:
+					return
+				case first = <-p.queue:
+				}
 			}
+			pending, overflow = encodeStreamBatch(first, p.queue)
 		}
 		frame, err := p.sender.Data(pending)
 		if err != nil {

@@ -24,7 +24,10 @@ func TestStreamBatchRoundTrip(t *testing.T) {
 	queue := make(chan []byte, 2)
 	queue <- []byte("second")
 	queue <- []byte("third")
-	payload := encodeStreamBatch([]byte("first"), queue)
+	payload, overflow := encodeStreamBatch([]byte("first"), queue)
+	if overflow != nil {
+		t.Fatalf("unexpected overflow packet: %q", overflow)
+	}
 	packets, ok := decodeStreamBatch(payload)
 	if !ok || len(packets) != 3 {
 		t.Fatalf("decoded batch = (%v, %v), want three packets", packets, ok)
@@ -33,6 +36,19 @@ func TestStreamBatchRoundTrip(t *testing.T) {
 		if string(packets[i]) != want {
 			t.Fatalf("packet %d = %q, want %q", i, packets[i], want)
 		}
+	}
+}
+
+func TestStreamBatchPreservesOverflowPacket(t *testing.T) {
+	first := make([]byte, streamBatchMax-8)
+	queue := make(chan []byte, 1)
+	queue <- []byte("overflow")
+	payload, overflow := encodeStreamBatch(first, queue)
+	if len(payload) != len(first)+4 {
+		t.Fatalf("batch length = %d, want %d", len(payload), len(first)+4)
+	}
+	if string(overflow) != "overflow" {
+		t.Fatalf("overflow = %q, want preserved packet", overflow)
 	}
 }
 
