@@ -11,7 +11,7 @@ import (
 
 const (
 	streamOpenTimeout = 5 * time.Second
-	streamBatchWait   = 10 * time.Millisecond
+	streamBatchWait   = 0
 	streamBatchMax    = 64 << 10
 )
 
@@ -32,6 +32,18 @@ func encodeStreamBatch(first []byte, queue <-chan []byte) []byte {
 	}
 	if !appendPacket(first) {
 		return first
+	}
+	if streamBatchWait <= 0 {
+		for {
+			select {
+			case packet := <-queue:
+				if !appendPacket(packet) {
+					return batch
+				}
+			default:
+				return batch
+			}
+		}
 	}
 	timer := time.NewTimer(streamBatchWait)
 	defer timer.Stop()
