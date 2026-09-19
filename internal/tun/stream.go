@@ -237,10 +237,12 @@ func (r *Runtime) streamLoop(ctx context.Context, peer PeerConfig) {
 	}
 	select {
 	case <-port.openErr:
+		r.logf("stream peer %s open rejected", peer.Name)
 		port.close()
 		r.fallbackRelay(ctx, peer)
 		return
 	case <-time.After(streamOpenTimeout):
+		r.logf("stream peer %s open timeout", peer.Name)
 		port.close()
 		r.fallbackRelay(ctx, peer)
 		return
@@ -367,6 +369,7 @@ func (h runtimeHandler) OnStream(ctx context.Context, packet turntf.Packet, fram
 	r := h.runtime
 	switch frame.Kind {
 	case turntf.StreamFrameOpen:
+		r.logf("stream open received from %d:%d epoch=%d", packet.Sender.NodeID, packet.Sender.UserID, frame.Epoch)
 		r.streamMu.Lock()
 		receiver := r.streamRecv[frame.ID]
 		if receiver == nil {
@@ -377,6 +380,7 @@ func (h runtimeHandler) OnStream(ctx context.Context, packet turntf.Packet, fram
 		ack := turntf.StreamFrame{Kind: turntf.StreamFrameOpenAck, ID: frame.ID, Epoch: frame.Epoch, Window: frame.Window}
 		_, _ = r.client.SendStreamFrame(ctx, packet.Sender, packet.TargetSession, ack, turntf.DeliveryModeRouteRetry)
 	case turntf.StreamFrameOpenAck:
+		r.logf("stream open acknowledged by %d:%d epoch=%d", packet.Sender.NodeID, packet.Sender.UserID, frame.Epoch)
 		r.streamMu.RLock()
 		port := r.streamPorts[packet.Sender]
 		r.streamMu.RUnlock()
