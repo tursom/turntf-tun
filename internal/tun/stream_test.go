@@ -15,6 +15,27 @@ func testStreamPort() *streamPort {
 	}
 }
 
+func TestStreamBatchRoundTrip(t *testing.T) {
+	queue := make(chan []byte, 2)
+	queue <- []byte("second")
+	queue <- []byte("third")
+	payload := encodeStreamBatch([]byte("first"), queue)
+	packets, ok := decodeStreamBatch(payload)
+	if !ok || len(packets) != 3 {
+		t.Fatalf("decoded batch = (%v, %v), want three packets", packets, ok)
+	}
+	for i, want := range []string{"first", "second", "third"} {
+		if string(packets[i]) != want {
+			t.Fatalf("packet %d = %q, want %q", i, packets[i], want)
+		}
+	}
+}
+
+func TestStreamBatchRejectsMalformedPayload(t *testing.T) {
+	if packets, ok := decodeStreamBatch([]byte{streamPacketMagic[0], streamPacketMagic[1], 0, 4, 'x'}); ok || packets != nil {
+		t.Fatalf("malformed batch decoded as (%v, %v)", packets, ok)
+	}
+}
 func TestStreamPortResumeKeepsIDAndPendingSuffix(t *testing.T) {
 	p := testStreamPort()
 	if !p.enqueue([]byte("queued")) {

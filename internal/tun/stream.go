@@ -2,13 +2,68 @@ package tun
 
 import (
 	"context"
+	"encoding/binary"
 	"sync"
 	"time"
 
 	turntf "github.com/tursom/turntf-go"
 )
 
-const streamOpenTimeout = 5 * time.Second
+const (
+	streamOpenTimeout = 5 * time.Second
+	streamBatchWait   = 2 * time.Millisecond
+	streamBatchMax    = 64 << 10
+)
+
+var streamPacketMagic = [2]byte{0x54, 0x50}
+
+func encodeStreamBatch(first []byte, queue <-chan []byte) []byte {
+	batch := make([]byte, 0, len(first)+8)
+	batch = append(batch, streamPacketMagic[:]...)
+	appendPacket := func(packet []byte) bool {
+		if len(packet) > 0xffff || len(batch)+2+len(packet) > streamBatchMax {
+			return false
+		}
+		var length [2]byte
+		binary.BigEndian.PutUint16(length[:], uint16(len(packet)))
+		batch = append(batch, length[:]...)
+		batch = append(batch, packet...)
+		return true
+	}
+	if !appendPacket(first) {
+		return first
+	}
+	for {
+		select {
+		case packet := <-queue:
+			if !appendPacket(packet) {
+				return batch
+			}
+		default:
+			return batch
+		}
+	}
+}
+
+func decodeStreamBatch(payload []byte) ([][]byte, bool) {
+	if len(payload) < len(streamPacketMagic) || payload[0] != streamPacketMagic[0] || payload[1] != streamPacketMagic[1] {
+		return nil, false
+	}
+	var packets [][]byte
+	for offset := len(streamPacketMagic); offset < len(payload); {
+		if len(payload)-offset < 2 {
+			return nil, false
+		}
+		length := int(binary.BigEndian.Uint16(payload[offset : offset+2]))
+		offset += 2
+		if length == 0 || length > len(payload)-offset {
+			return nil, false
+		}
+		packets = append(packets, payload[offset:offset+length])
+		offset += length
+	}
+	return packets, len(packets) > 0
+}
 
 type streamPort struct {
 	runtime       *Runtime
@@ -251,7 +306,8 @@ func (r *Runtime) writeStreamLoop(p *streamPort) {
 				return
 			case <-ready:
 				continue
-			case pending = <-p.queue:
+			case first := <-p.queue:
+				pending = encodeStreamBatch(first, p.queue)
 			}
 		}
 		frame, err := p.sender.Data(pending)
@@ -324,7 +380,13 @@ func (h runtimeHandler) OnStream(ctx context.Context, packet turntf.Packet, fram
 		}
 		if len(payload) > 0 {
 			r.writeMu.Lock()
-			_ = r.device.WritePacket(payload)
+			if packets, batched := decodeStreamBatch(payload); batched {
+				for _, packetPayload := range packets {
+					_ = r.device.WritePacket(packetPayload)
+				}
+			} else {
+				_ = r.device.WritePacket(payload)
+			}
 			r.writeMu.Unlock()
 		}
 		_, _ = r.client.SendStreamFrame(ctx, receiver.peer, receiver.targetSession, ack, turntf.DeliveryModeRouteRetry)
