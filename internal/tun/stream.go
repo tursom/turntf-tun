@@ -11,7 +11,7 @@ import (
 
 const (
 	streamOpenTimeout = 5 * time.Second
-	streamBatchWait   = 2 * time.Millisecond
+	streamBatchWait   = 10 * time.Millisecond
 	streamBatchMax    = 64 << 10
 )
 
