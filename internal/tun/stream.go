@@ -99,11 +99,18 @@ type streamPort struct {
 	openErr       chan error
 	done          chan struct{}
 	once          sync.Once
+	queuedOnce    sync.Once
+	sentOnce      sync.Once
 }
 
 func (p *streamPort) enqueue(packet []byte) bool {
 	select {
 	case p.queue <- append([]byte(nil), packet...):
+		p.queuedOnce.Do(func() {
+			if p.runtime != nil {
+				p.runtime.logf("stream packet queued for %d:%d", p.peer.NodeID, p.peer.UserID)
+			}
+		})
 		return true
 	default:
 		return false
@@ -339,6 +346,8 @@ func (r *Runtime) writeStreamLoop(p *streamPort) {
 		pending = nil
 		if _, err = r.client.SendStreamFrame(context.Background(), p.peer, session, frame, turntf.DeliveryModeRouteRetry); err != nil {
 			p.markPathLost()
+		} else {
+			p.sentOnce.Do(func() { r.logf("stream data sent to %d:%d", p.peer.NodeID, p.peer.UserID) })
 		}
 	}
 }
@@ -351,6 +360,7 @@ type streamReceiver struct {
 	peer          turntf.UserRef
 	targetSession turntf.SessionRef
 	state         *turntf.StreamReceiverState
+	receivedOnce  sync.Once
 }
 
 type runtimeHandler struct{ runtime *Runtime }
@@ -398,6 +408,7 @@ func (h runtimeHandler) OnStream(ctx context.Context, packet turntf.Packet, fram
 			return
 		}
 		if len(payload) > 0 {
+			receiver.receivedOnce.Do(func() { r.logf("stream data received from %d:%d", receiver.peer.NodeID, receiver.peer.UserID) })
 			r.writeMu.Lock()
 			if packets, batched := decodeStreamBatch(payload); batched {
 				for _, packetPayload := range packets {
