@@ -323,8 +323,6 @@ func (r *Runtime) writeStreamLoop(p *streamPort) {
 			select {
 			case <-p.done:
 				return
-			case <-ready:
-				continue
 			case first := <-p.queue:
 				pending = encodeStreamBatch(first, p.queue)
 			}
