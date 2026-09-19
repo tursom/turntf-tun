@@ -16,11 +16,14 @@ type Logger interface{ Printf(string, ...any) }
 
 type peerConfig struct{ config *PeerConfig }
 type peerPort struct {
-	peer  *peerConfig
-	conn  *turntf.RelayConnection
-	queue chan []byte
-	done  chan struct{}
-	once  sync.Once
+	runtime    *Runtime
+	peer       *peerConfig
+	conn       *turntf.RelayConnection
+	queue      chan []byte
+	done       chan struct{}
+	once       sync.Once
+	queuedOnce sync.Once
+	sentOnce   sync.Once
 }
 
 func (p *peerPort) close() {
@@ -35,6 +38,11 @@ func (p *peerPort) enqueue(packet []byte) bool {
 	packet = append([]byte(nil), packet...)
 	select {
 	case p.queue <- packet:
+		p.queuedOnce.Do(func() {
+			if p.runtime != nil && p.peer != nil && p.peer.config != nil {
+				p.runtime.logf("relay packet queued for peer %s", p.peer.config.Name)
+			}
+		})
 		return true
 	default:
 		return false
@@ -256,7 +264,7 @@ func (r *Runtime) acceptRelay(ctx context.Context, conn *turntf.RelayConnection)
 	r.registerPort(ctx, *peer, conn)
 }
 func (r *Runtime) registerPort(ctx context.Context, peer PeerConfig, conn *turntf.RelayConnection) *peerPort {
-	p := &peerPort{peer: &peerConfig{config: &peer}, conn: conn, queue: make(chan []byte, r.cfg.Transport.SendQueueSize), done: make(chan struct{})}
+	p := &peerPort{runtime: r, peer: &peerConfig{config: &peer}, conn: conn, queue: make(chan []byte, r.cfg.Transport.SendQueueSize), done: make(chan struct{})}
 	user := peer.User.ToTurntf()
 	r.mu.Lock()
 	if r.activeStreams[user] != nil {
@@ -328,6 +336,7 @@ func (r *Runtime) writeRelayLoop(p *peerPort) {
 			p.close()
 			return
 		}
+		p.sentOnce.Do(func() { p.runtime.logf("relay data sent to peer %s", p.peer.config.Name) })
 	}
 }
 func (r *Runtime) readRelayLoop(ctx context.Context, p *peerPort) {
