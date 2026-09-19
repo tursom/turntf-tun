@@ -50,27 +50,28 @@ func (p *peerPort) enqueue(packet []byte) bool {
 }
 
 type Runtime struct {
-	cfg           Config
-	logger        Logger
-	device        PacketDevice
-	client        *turntf.Client
-	relay         *turntf.Relay
-	relayCfg      turntf.RelayConfig
-	routes        *routeTable
-	mu            sync.RWMutex
-	ports         map[turntf.UserRef]*peerPort
-	activeStreams map[turntf.UserRef]*streamPort
-	writeMu       sync.Mutex
-	streamMu      sync.RWMutex
-	streamPorts   map[turntf.UserRef]*streamPort
-	streamRecv    map[turntf.StreamID]*streamReceiver
-	streamResolve func(context.Context, turntf.UserRef) (turntf.ResolvedUserSessions, error)
-	streamSend    func(context.Context, turntf.UserRef, turntf.SessionRef, turntf.StreamFrame, turntf.DeliveryMode) (turntf.RelayAccepted, error)
-	streamNewID   func() (turntf.StreamID, error)
-	relayDial     func(context.Context, PeerConfig)
-	localUser     turntf.UserRef
-	connected     bool
-	releaseLease  func(context.Context)
+	cfg              Config
+	logger           Logger
+	device           PacketDevice
+	client           *turntf.Client
+	relay            *turntf.Relay
+	relayCfg         turntf.RelayConfig
+	routes           *routeTable
+	mu               sync.RWMutex
+	ports            map[turntf.UserRef]*peerPort
+	activeStreams    map[turntf.UserRef]*streamPort
+	writeMu          sync.Mutex
+	streamMu         sync.RWMutex
+	streamPorts      map[turntf.UserRef]*streamPort
+	streamRecv       map[turntf.StreamID]*streamReceiver
+	preferredStreams map[turntf.UserRef]turntf.SessionRef
+	streamResolve    func(context.Context, turntf.UserRef) (turntf.ResolvedUserSessions, error)
+	streamSend       func(context.Context, turntf.UserRef, turntf.SessionRef, turntf.StreamFrame, turntf.DeliveryMode) (turntf.RelayAccepted, error)
+	streamNewID      func() (turntf.StreamID, error)
+	relayDial        func(context.Context, PeerConfig)
+	localUser        turntf.UserRef
+	connected        bool
+	releaseLease     func(context.Context)
 }
 
 func Run(ctx context.Context, cfg Config, logger Logger) error {
@@ -134,7 +135,7 @@ func NewRuntime(cfg Config, device PacketDevice, routes *routeTable, logger Logg
 	relayCfg.DeliveryMode = turntf.DeliveryModeBestEffort
 	relayCfg.WindowSize = cfg.Transport.RelayWindowSize
 	relayCfg.SendBufferSize = relaySendBufferBytes
-	rt := &Runtime{cfg: cfg, logger: logger, device: device, routes: routes, relayCfg: relayCfg, ports: make(map[turntf.UserRef]*peerPort), activeStreams: make(map[turntf.UserRef]*streamPort), streamPorts: make(map[turntf.UserRef]*streamPort), streamRecv: make(map[turntf.StreamID]*streamReceiver)}
+	rt := &Runtime{cfg: cfg, logger: logger, device: device, routes: routes, relayCfg: relayCfg, ports: make(map[turntf.UserRef]*peerPort), activeStreams: make(map[turntf.UserRef]*streamPort), streamPorts: make(map[turntf.UserRef]*streamPort), streamRecv: make(map[turntf.StreamID]*streamReceiver), preferredStreams: make(map[turntf.UserRef]turntf.SessionRef)}
 	client, err := turntf.NewClient(turntf.Config{BaseURL: cfg.Turntf.BaseURL, Credentials: credentials, CursorStore: turntf.NewMemoryCursorStore(), Handler: runtimeHandler{runtime: rt}, RequestTimeout: cfg.Turntf.RequestTimeout.Duration, PingInterval: cfg.Turntf.PingInterval.Duration, TransientOnly: true, RealtimeStream: true})
 	if err != nil {
 		return nil, err

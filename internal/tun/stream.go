@@ -302,16 +302,20 @@ func (r *Runtime) streamLoop(ctx context.Context, peer PeerConfig) {
 
 func (r *Runtime) runStream(ctx context.Context, peer PeerConfig, streamReady func()) streamRunResult {
 	target := peer.User.ToTurntf()
-	sessions, err := r.resolveStreamSessions(ctx, target)
-	if err != nil {
-		r.logf("resolve stream peer %s: %v", peer.Name, err)
-		return streamRunFallback
-	}
-	var targetSession turntf.SessionRef
-	for _, candidate := range sessions.Sessions {
-		if candidate.TransientCapable {
-			targetSession = candidate.Session
-			break
+	r.streamMu.RLock()
+	targetSession := r.preferredStreams[target]
+	r.streamMu.RUnlock()
+	if targetSession.IsZero() {
+		sessions, err := r.resolveStreamSessions(ctx, target)
+		if err != nil {
+			r.logf("resolve stream peer %s: %v", peer.Name, err)
+			return streamRunFallback
+		}
+		for _, candidate := range sessions.Sessions {
+			if candidate.TransientCapable {
+				targetSession = candidate.Session
+				break
+			}
 		}
 	}
 	if targetSession.IsZero() {
@@ -533,7 +537,21 @@ func (h runtimeHandler) OnStream(ctx context.Context, packet turntf.Packet, fram
 			receiver = &streamReceiver{peer: packet.Sender, targetSession: packet.TargetSession, state: turntf.NewStreamReceiverState(frame.ID, frame.Epoch, frame.Window)}
 			r.streamRecv[frame.ID] = receiver
 		}
+		restart := false
+		if !packet.TargetSession.IsZero() {
+			if r.preferredStreams == nil {
+				r.preferredStreams = make(map[turntf.UserRef]turntf.SessionRef)
+			}
+			r.preferredStreams[packet.Sender] = packet.TargetSession
+			if port := r.streamPorts[packet.Sender]; port != nil {
+				session, _ := port.currentPath()
+				restart = session != packet.TargetSession && port.requestRestart(packet.TargetSession)
+			}
+		}
 		r.streamMu.Unlock()
+		if restart {
+			r.logf("stream peer %d:%d observed new session; rebuilding outbound stream", packet.Sender.NodeID, packet.Sender.UserID)
+		}
 		ack := turntf.StreamFrame{Kind: turntf.StreamFrameOpenAck, ID: frame.ID, Epoch: frame.Epoch, Window: frame.Window}
 		_, _ = r.sendStreamFrame(ctx, packet.Sender, packet.TargetSession, ack)
 	case turntf.StreamFrameOpenAck:
