@@ -86,6 +86,11 @@ func configureTUN(name string, cfg TunConfig) error {
 			return fmt.Errorf("set tun mtu: %w", err)
 		}
 	}
+	if cfg.TxQueueLength > 0 {
+		if err := netlink.LinkSetTxQLen(link, cfg.TxQueueLength); err != nil {
+			return fmt.Errorf("set tun tx queue length: %w", err)
+		}
+	}
 	for _, raw := range cfg.Addresses {
 		addr, err := netlink.ParseAddr(raw)
 		if err != nil {

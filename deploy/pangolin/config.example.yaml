@@ -12,6 +12,7 @@ turntf:
 tun:
   name: "turntf0"
   mtu: 1400
+  tx_queue_length: 1000
   addresses:
     - "10.250.0.5/32"
   bring_up: true

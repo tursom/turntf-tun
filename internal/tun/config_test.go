@@ -11,11 +11,28 @@ func TestConfigDefaultsToHighThroughputTunSettings(t *testing.T) {
 	if cfg.Transport.Mode != "auto" {
 		t.Fatalf("transport mode default: %q", cfg.Transport.Mode)
 	}
-	if cfg.Tun.Name != "turntf0" || cfg.Tun.MTU != 1400 {
+	if cfg.Tun.Name != "turntf0" || cfg.Tun.MTU != 1400 || cfg.Tun.TxQueueLength != 500 {
 		t.Fatalf("tun defaults: %+v", cfg.Tun)
 	}
 	if cfg.Transport.SendQueueSize != 4096 || cfg.Transport.MaxPacketBytes != 65535 {
 		t.Fatalf("transport defaults: %+v", cfg.Transport)
+	}
+}
+
+func TestConfigRejectsInvalidTunTxQueueLength(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.Tun.TxQueueLength = -1
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "tun.tx_queue_length") {
+		t.Fatalf("Validate() error = %v, want tun.tx_queue_length error", err)
+	}
+}
+
+func TestConfigPreservesExplicitTunTxQueueLength(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.Tun.TxQueueLength = 1000
+	cfg.ApplyDefaults()
+	if cfg.Tun.TxQueueLength != 1000 {
+		t.Fatalf("tun tx queue length = %d, want 1000", cfg.Tun.TxQueueLength)
 	}
 }
 

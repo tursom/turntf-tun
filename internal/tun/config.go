@@ -25,6 +25,7 @@ const ExampleConfig = `turntf:
 tun:
   name: "turntf0"
   mtu: 1400
+  tx_queue_length: 1000
   addresses:
     - "10.250.0.1/32"
   bring_up: true
@@ -103,10 +104,11 @@ type PasswordConfig struct {
 	Value  string `yaml:"value"`
 }
 type TunConfig struct {
-	Name      string   `yaml:"name"`
-	MTU       int      `yaml:"mtu"`
-	Addresses []string `yaml:"addresses"`
-	BringUp   bool     `yaml:"bring_up"`
+	Name          string   `yaml:"name"`
+	MTU           int      `yaml:"mtu"`
+	TxQueueLength int      `yaml:"tx_queue_length"`
+	Addresses     []string `yaml:"addresses"`
+	BringUp       bool     `yaml:"bring_up"`
 }
 type TransportConfig struct {
 	Mode              string   `yaml:"mode"`
@@ -161,6 +163,9 @@ func (c *Config) ApplyDefaults() {
 	if c.Tun.MTU == 0 {
 		c.Tun.MTU = 1400
 	}
+	if c.Tun.TxQueueLength == 0 {
+		c.Tun.TxQueueLength = 500
+	}
 	if c.Transport.SendQueueSize == 0 {
 		c.Transport.SendQueueSize = 4096
 	}
@@ -200,6 +205,9 @@ func (c Config) Validate() error {
 
 	if c.Tun.MTU < 576 || c.Tun.MTU > 65535 {
 		return errors.New("tun.mtu must be between 576 and 65535")
+	}
+	if c.Tun.TxQueueLength < 1 || c.Tun.TxQueueLength > 100000 {
+		return errors.New("tun.tx_queue_length must be between 1 and 100000")
 	}
 	if !validTransportMode(c.Transport.Mode) {
 		return errors.New("transport.mode must be auto, stream or relay")

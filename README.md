@@ -12,6 +12,7 @@
 - SDK 收到无 live connection owner 的 non-OPEN Relay 帧时，TUN 记录 quoted `relay_id` 和 `kind`；日志不包含 payload、session 或凭据。
 - 每个 peer 使用独立的数据面状态；可通过 `peers[].transport_mode` 在同一进程内混用 Relay 和 stream，单个 peer 的 stream 建连、重试或拥塞不会切换其他 peer 的传输模式。
 - TUN MTU 应按实际出口和 turntf 封装开销选择。默认 `1400`，部署后可通过吞吐、丢包和长尾测试调整。
+- `tun.tx_queue_length` 控制 Linux TUN 发送队列，默认 `500`。生产模板使用实测折中值 `1000`；队列过小会产生与内层 TCP 重传对应的 qdisc drop，过大则可能增加 bufferbloat，调整时必须同时检查吞吐、drop 和负载后 RTT。
 
 这不是二层交换机，不提供 ARP、广播、组播泛洪、NAT 或真实 LAN 网段转发。需要二层互通时使用 `turntf-tap-switch`。
 
@@ -99,6 +100,7 @@ kr、cc、kiwi 可以使用同一虚拟网段，但每个节点只把对端地�
 tun:
   name: "turntf0"
   mtu: 1400
+  tx_queue_length: 1000
   addresses: ["10.250.0.1/32"]
 peers:
   - name: "cc"
@@ -135,4 +137,4 @@ stream 激活后的出口优先级也按 peer 隔离：只有目标 peer 已激�
 
 ## 性能边界
 
-TUN 进程会在队列满时丢弃 packet，因此它不会用无界内存换吞吐。最终性能仍受 turntf WebSocket、核心节点调度、Relay 窗口和公网路径影响。部署前应同时观察吞吐、丢包、首包延迟、并发空窗、内存和长尾；不能只用单次下载速度选择 MTU。
+TUN 进程会在应用发送队列满时丢弃 packet，因此它不会用无界内存换吞吐。Linux TUN qdisc 也可能在 `tx_queue_length` 耗尽时丢包；该 drop 通常会表现为内层 TCP 重传。最终性能仍受 turntf WebSocket、核心节点调度、stream 窗口和公网路径影响。部署前应同时观察吞吐、TUN RX/TX drop、重传、首包延迟、并发空窗、内存和负载后长尾；不能只用单次下载速度选择 MTU 或队列长度。
