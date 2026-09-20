@@ -25,14 +25,15 @@ type relayConn interface {
 }
 
 type peerPort struct {
-	runtime    *Runtime
-	peer       *peerConfig
-	conn       relayConn
-	queue      chan []byte
-	done       chan struct{}
-	once       sync.Once
-	queuedOnce sync.Once
-	sentOnce   sync.Once
+	runtime      *Runtime
+	peer         *peerConfig
+	conn         relayConn
+	queue        chan []byte
+	done         chan struct{}
+	once         sync.Once
+	queuedOnce   sync.Once
+	sentOnce     sync.Once
+	receivedOnce sync.Once
 }
 
 func (p *peerPort) close() {
@@ -405,6 +406,7 @@ func (r *Runtime) readRelayLoop(ctx context.Context, p *peerPort) {
 			p.close()
 			return
 		}
+		p.receivedOnce.Do(func() { r.logf("relay data received from peer %s", p.peer.config.Name) })
 	}
 }
 func (r *Runtime) closePorts() {
