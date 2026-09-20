@@ -126,6 +126,87 @@ func TestReadTUNUsesActiveStreamPerPeerAndRelayForOthers(t *testing.T) {
 	waitForDone(t, done, "TUN read loop did not stop")
 }
 
+func TestReadRelayLoopWritesDecodedBatchToDevice(t *testing.T) {
+	device := &recordingPacketDevice{writes: make(chan []byte, 2)}
+	conn := newFakeRelayConn("relay-a")
+	r := &Runtime{
+		cfg:    Config{Transport: TransportConfig{MaxPacketBytes: 65535}},
+		device: device,
+	}
+	peer := PeerConfig{Name: "peer"}
+	port := &peerPort{runtime: r, peer: &peerConfig{config: &peer}, conn: conn, done: make(chan struct{})}
+	first := ipv4Packet(10, 0, 0, 2)
+	second := ipv4Packet(10, 0, 0, 3)
+	batch, ok := appendTunBatch(nil, first)
+	if !ok {
+		t.Fatal("append first packet")
+	}
+	batch, ok = appendTunBatch(batch, second)
+	if !ok {
+		t.Fatal("append second packet")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		r.readRelayLoop(ctx, port)
+		close(done)
+	}()
+	conn.receive <- batch
+
+	for _, want := range [][]byte{first, second} {
+		select {
+		case got := <-device.writes:
+			if string(got) != string(want) {
+				t.Fatalf("device packet = %v, want %v", got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("relay batch was not written to device")
+		}
+	}
+	port.close()
+	waitForDone(t, done, "relay read loop did not stop")
+}
+
+func TestRegisterPortConvergesOnLowestRelayID(t *testing.T) {
+	peerRef := turntf.UserRef{NodeID: 2, UserID: 1}
+	peer := PeerConfig{Name: "peer", User: UserRefConfig{NodeID: peerRef.NodeID, UserID: peerRef.UserID}}
+	r := &Runtime{
+		cfg:           Config{Transport: TransportConfig{SendQueueSize: 1, MaxPacketBytes: 65535}},
+		device:        &recordingPacketDevice{writes: make(chan []byte, 1)},
+		ports:         make(map[turntf.UserRef]*peerPort),
+		activeStreams: make(map[turntf.UserRef]*streamPort),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	higher := newFakeRelayConn("relay-z")
+	lower := newFakeRelayConn("relay-a")
+	rejected := newFakeRelayConn("relay-y")
+
+	higherPort := r.registerPort(ctx, peer, higher)
+	lowerPort := r.registerPort(ctx, peer, lower)
+	rejectedPort := r.registerPort(ctx, peer, rejected)
+
+	r.mu.RLock()
+	got := r.ports[peerRef]
+	r.mu.RUnlock()
+	if got != lowerPort {
+		t.Fatalf("selected port = %p, want lower relay ID port %p", got, lowerPort)
+	}
+	select {
+	case <-higherPort.done:
+	default:
+		t.Fatal("higher relay ID port was not replaced")
+	}
+	select {
+	case <-rejectedPort.done:
+	default:
+		t.Fatal("later higher relay ID port was not rejected")
+	}
+	lowerPort.close()
+}
+
 func waitForNamedDial(t *testing.T, dials <-chan string, want string) {
 	t.Helper()
 	timer := time.NewTimer(time.Second)
@@ -172,6 +253,71 @@ func (d *queuedPacketDevice) ReadPacket(ctx context.Context) ([]byte, error) {
 }
 func (d *queuedPacketDevice) WritePacket([]byte) error { return nil }
 func (d *queuedPacketDevice) Close() error             { return nil }
+
+type recordingPacketDevice struct {
+	writes chan []byte
+}
+
+func (d *recordingPacketDevice) Name() string { return "test" }
+func (d *recordingPacketDevice) ReadPacket(ctx context.Context) ([]byte, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+func (d *recordingPacketDevice) WritePacket(packet []byte) error {
+	d.writes <- append([]byte(nil), packet...)
+	return nil
+}
+func (d *recordingPacketDevice) Close() error { return nil }
+
+type fakeRelayConn struct {
+	id        string
+	receive   chan []byte
+	closed    chan struct{}
+	once      sync.Once
+	mu        sync.Mutex
+	callbacks []func(error)
+}
+
+func newFakeRelayConn(id string) *fakeRelayConn {
+	return &fakeRelayConn{id: id, receive: make(chan []byte, 1), closed: make(chan struct{})}
+}
+
+func (c *fakeRelayConn) RelayID() string   { return c.id }
+func (c *fakeRelayConn) Send([]byte) error { return nil }
+func (c *fakeRelayConn) ReceiveTimeout(timeout time.Duration) ([]byte, error) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case packet := <-c.receive:
+		return packet, nil
+	case <-c.closed:
+		return nil, &turntf.RelayError{Code: turntf.RelayErrorClientClosed, Message: "closed"}
+	case <-timer.C:
+		return nil, &turntf.RelayError{Code: turntf.RelayErrorReceiveTimeout, Message: "timeout"}
+	}
+}
+func (c *fakeRelayConn) Abort(err error) {
+	c.once.Do(func() {
+		close(c.closed)
+		c.mu.Lock()
+		callbacks := append([]func(error){}, c.callbacks...)
+		c.mu.Unlock()
+		for _, callback := range callbacks {
+			go callback(err)
+		}
+	})
+}
+func (c *fakeRelayConn) OnClose(callback func(error)) {
+	c.mu.Lock()
+	select {
+	case <-c.closed:
+		c.mu.Unlock()
+		callback(errors.New("closed"))
+	default:
+		c.callbacks = append(c.callbacks, callback)
+		c.mu.Unlock()
+	}
+}
 
 func ipv4Packet(a, b, c, d byte) []byte {
 	packet := make([]byte, 20)

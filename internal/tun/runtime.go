@@ -15,10 +15,19 @@ const relaySendBufferBytes = 8 << 20
 type Logger interface{ Printf(string, ...any) }
 
 type peerConfig struct{ config *PeerConfig }
+
+type relayConn interface {
+	RelayID() string
+	Send([]byte) error
+	ReceiveTimeout(time.Duration) ([]byte, error)
+	Abort(error)
+	OnClose(func(error))
+}
+
 type peerPort struct {
 	runtime    *Runtime
 	peer       *peerConfig
-	conn       *turntf.RelayConnection
+	conn       relayConn
 	queue      chan []byte
 	done       chan struct{}
 	once       sync.Once
@@ -264,7 +273,7 @@ func (r *Runtime) acceptRelay(ctx context.Context, conn *turntf.RelayConnection)
 	r.logf("accepted peer %s relay=%s", peer.Name, conn.RelayID())
 	r.registerPort(ctx, *peer, conn)
 }
-func (r *Runtime) registerPort(ctx context.Context, peer PeerConfig, conn *turntf.RelayConnection) *peerPort {
+func (r *Runtime) registerPort(ctx context.Context, peer PeerConfig, conn relayConn) *peerPort {
 	p := &peerPort{runtime: r, peer: &peerConfig{config: &peer}, conn: conn, queue: make(chan []byte, r.cfg.Transport.SendQueueSize), done: make(chan struct{})}
 	user := peer.User.ToTurntf()
 	r.mu.Lock()
@@ -274,6 +283,11 @@ func (r *Runtime) registerPort(ctx context.Context, peer PeerConfig, conn *turnt
 		return p
 	}
 	old := r.ports[user]
+	if old != nil && old.conn.RelayID() <= conn.RelayID() {
+		r.mu.Unlock()
+		p.close()
+		return p
+	}
 	r.ports[user] = p
 	r.mu.Unlock()
 	if old != nil {
