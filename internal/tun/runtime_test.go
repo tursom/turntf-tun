@@ -3,12 +3,27 @@ package tun
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	turntf "github.com/tursom/turntf-go"
 )
+
+func TestRelayOrphanLogContainsOnlySafeMetadata(t *testing.T) {
+	logger := &recordingLogger{}
+	r := &Runtime{logger: logger}
+	r.logRelayOrphan("relay\nsecret", turntf.RelayKindData)
+	line := logger.last()
+	if !strings.Contains(line, `relay_id="relay\nsecret"`) || !strings.Contains(line, "kind=DATA") {
+		t.Fatalf("orphan log = %q", line)
+	}
+	if strings.Contains(line, "payload") || strings.Contains(line, "credential") {
+		t.Fatalf("orphan log exposed forbidden fields: %q", line)
+	}
+}
 
 func TestRunPeerMixedTransportOnlyStreamPeerSendsOpen(t *testing.T) {
 	local := turntf.UserRef{NodeID: 1, UserID: 1}
@@ -169,42 +184,137 @@ func TestReadRelayLoopWritesDecodedBatchToDevice(t *testing.T) {
 	waitForDone(t, done, "relay read loop did not stop")
 }
 
-func TestRegisterPortConvergesOnLowestRelayID(t *testing.T) {
+func TestRegisterPortKeepsFiveSessionReceivePathsAndPromotesOutbound(t *testing.T) {
 	peerRef := turntf.UserRef{NodeID: 2, UserID: 1}
 	peer := PeerConfig{Name: "peer", User: UserRefConfig{NodeID: peerRef.NodeID, UserID: peerRef.UserID}}
+	device := &recordingPacketDevice{writes: make(chan []byte, 8)}
 	r := &Runtime{
-		cfg:           Config{Transport: TransportConfig{SendQueueSize: 1, MaxPacketBytes: 65535}},
-		device:        &recordingPacketDevice{writes: make(chan []byte, 1)},
+		cfg:           Config{Transport: TransportConfig{SendQueueSize: 8, MaxPacketBytes: 65535}},
+		device:        device,
 		ports:         make(map[turntf.UserRef]*peerPort),
+		relayPorts:    make(map[turntf.UserRef]map[string]*peerPort),
 		activeStreams: make(map[turntf.UserRef]*streamPort),
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	higher := newFakeRelayConn("relay-z")
-	lower := newFakeRelayConn("relay-a")
-	rejected := newFakeRelayConn("relay-y")
 
-	higherPort := r.registerPort(ctx, peer, higher)
-	lowerPort := r.registerPort(ctx, peer, lower)
-	rejectedPort := r.registerPort(ctx, peer, rejected)
+	ids := []string{"relay-z", "relay-y", "relay-a", "relay-m", "relay-b"}
+	connections := make(map[string]*fakeRelayConn, len(ids))
+	ports := make(map[string]*peerPort, len(ids))
+	for _, id := range ids {
+		conn := newFakeRelayConn(id)
+		connections[id] = conn
+		ports[id] = r.registerPort(ctx, peer, conn)
+	}
 
 	r.mu.RLock()
-	got := r.ports[peerRef]
+	selected := r.ports[peerRef]
+	live := len(r.relayPorts[peerRef])
 	r.mu.RUnlock()
-	if got != lowerPort {
-		t.Fatalf("selected port = %p, want lower relay ID port %p", got, lowerPort)
+	if selected != ports["relay-a"] || live != 5 {
+		t.Fatalf("selected=%p live=%d, want relay-a and 5", selected, live)
+	}
+	for _, id := range ids {
+		select {
+		case <-connections[id].closed:
+			t.Fatalf("receive path %s was aborted during selection", id)
+		default:
+		}
+		packet := ipv4Packet(10, 0, 0, byte(len(id)))
+		batch, ok := appendTunBatch(nil, packet)
+		if !ok {
+			t.Fatalf("append packet for %s", id)
+		}
+		connections[id].receive <- batch
+		select {
+		case got := <-device.writes:
+			if string(got) != string(packet) {
+				t.Fatalf("received packet for %s = %v, want %v", id, got, packet)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("receive path %s did not reach TUN", id)
+		}
+	}
+
+	outbound := ipv4Packet(10, 1, 0, 1)
+	if !selected.enqueue(outbound) {
+		t.Fatal("selected outbound queue rejected packet")
 	}
 	select {
-	case <-higherPort.done:
-	default:
-		t.Fatal("higher relay ID port was not replaced")
+	case <-connections["relay-a"].sent:
+	case <-time.After(time.Second):
+		t.Fatal("lowest relay ID did not carry outbound packet")
 	}
-	select {
-	case <-rejectedPort.done:
-	default:
-		t.Fatal("later higher relay ID port was not rejected")
+
+	connections["relay-a"].Abort(errors.New("reconnect"))
+	waitForCondition(t, func() bool {
+		r.mu.RLock()
+		defer r.mu.RUnlock()
+		return r.ports[peerRef] == ports["relay-b"] && len(r.relayPorts[peerRef]) == 4
+	}, "closed selected connection was not removed and promoted")
+	connections["relay-z"].Abort(errors.New("late close"))
+	waitForCondition(t, func() bool {
+		r.mu.RLock()
+		defer r.mu.RUnlock()
+		return r.ports[peerRef] == ports["relay-b"] && len(r.relayPorts[peerRef]) == 3
+	}, "late non-owner close changed the selected connection")
+
+	r.closePorts()
+}
+
+func TestRegisterPortConcurrentReconnectStress(t *testing.T) {
+	peerRef := turntf.UserRef{NodeID: 9, UserID: 9}
+	peer := PeerConfig{Name: "peer", User: UserRefConfig{NodeID: peerRef.NodeID, UserID: peerRef.UserID}}
+	r := &Runtime{
+		cfg:           Config{Transport: TransportConfig{SendQueueSize: 4, MaxPacketBytes: 65535}},
+		device:        &recordingPacketDevice{writes: make(chan []byte, 1)},
+		ports:         make(map[turntf.UserRef]*peerPort),
+		relayPorts:    make(map[turntf.UserRef]map[string]*peerPort),
+		activeStreams: make(map[turntf.UserRef]*streamPort),
 	}
-	lowerPort.close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	for round := 0; round < 40; round++ {
+		connections := make([]*fakeRelayConn, 5)
+		ports := make([]*peerPort, 5)
+		var registered sync.WaitGroup
+		for i := range connections {
+			connections[i] = newFakeRelayConn(fmt.Sprintf("round-%02d-relay-%d", round, i))
+			registered.Add(1)
+			go func(i int) {
+				defer registered.Done()
+				ports[i] = r.registerPort(ctx, peer, connections[i])
+			}(i)
+		}
+		registered.Wait()
+		waitForCondition(t, func() bool {
+			r.mu.RLock()
+			defer r.mu.RUnlock()
+			return len(r.relayPorts[peerRef]) == 5 && r.ports[peerRef] == ports[0]
+		}, "concurrent registration did not converge")
+
+		var staleCloses sync.WaitGroup
+		for i := 4; i >= 1; i-- {
+			staleCloses.Add(1)
+			go func(i int) {
+				defer staleCloses.Done()
+				connections[i].Abort(errors.New("stale reconnect close"))
+			}(i)
+		}
+		staleCloses.Wait()
+		waitForCondition(t, func() bool {
+			r.mu.RLock()
+			defer r.mu.RUnlock()
+			return len(r.relayPorts[peerRef]) == 1 && r.ports[peerRef] == ports[0]
+		}, "stale closes removed the active owner")
+		connections[0].Abort(errors.New("selected reconnect close"))
+		waitForCondition(t, func() bool {
+			r.mu.RLock()
+			defer r.mu.RUnlock()
+			return len(r.relayPorts[peerRef]) == 0 && r.ports[peerRef] == nil
+		}, "selected close left stale ownership")
+	}
 }
 
 func waitForNamedDial(t *testing.T, dials <-chan string, want string) {
@@ -231,6 +341,26 @@ func waitForGroup(t *testing.T, wg *sync.WaitGroup) {
 		close(done)
 	}()
 	waitForDone(t, done, "peer loops did not stop")
+}
+
+type recordingLogger struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *recordingLogger) Printf(format string, args ...any) {
+	l.mu.Lock()
+	l.lines = append(l.lines, fmt.Sprintf(format, args...))
+	l.mu.Unlock()
+}
+
+func (l *recordingLogger) last() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.lines) == 0 {
+		return ""
+	}
+	return l.lines[len(l.lines)-1]
 }
 
 type queuedPacketDevice struct {
@@ -272,6 +402,7 @@ func (d *recordingPacketDevice) Close() error { return nil }
 type fakeRelayConn struct {
 	id        string
 	receive   chan []byte
+	sent      chan []byte
 	closed    chan struct{}
 	once      sync.Once
 	mu        sync.Mutex
@@ -279,11 +410,18 @@ type fakeRelayConn struct {
 }
 
 func newFakeRelayConn(id string) *fakeRelayConn {
-	return &fakeRelayConn{id: id, receive: make(chan []byte, 1), closed: make(chan struct{})}
+	return &fakeRelayConn{id: id, receive: make(chan []byte, 1), sent: make(chan []byte, 16), closed: make(chan struct{})}
 }
 
-func (c *fakeRelayConn) RelayID() string   { return c.id }
-func (c *fakeRelayConn) Send([]byte) error { return nil }
+func (c *fakeRelayConn) RelayID() string { return c.id }
+func (c *fakeRelayConn) Send(payload []byte) error {
+	select {
+	case c.sent <- append([]byte(nil), payload...):
+		return nil
+	case <-c.closed:
+		return &turntf.RelayError{Code: turntf.RelayErrorClientClosed, Message: "closed"}
+	}
+}
 func (c *fakeRelayConn) ReceiveTimeout(timeout time.Duration) ([]byte, error) {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()

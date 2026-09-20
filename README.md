@@ -8,6 +8,8 @@
 - 每个 peer 配置明确的 CIDR 路由，支持 IPv4 和 IPv6。
 - Relay 使用 `at_least_once`，并在每个 peer 上把 IP packet 聚合成最多 128 KiB 的 batch；acceptance RPC 有界并行，避免高 RTT 链路上逐包等待，同时不引入可靠有序重排。IP 层上面的 TCP/UDP 仍负责自己的语义。
 - 每个 peer 有界发送队列；队列满时丢包，TUN 读循环不会等待慢 Relay。
+- 同一 peer 在多 session 或重连重叠期间可以保留多条 Relay 接收路径；最低 `relay_id` 只决定当前 TUN 出站路径，非选中连接仍持续接收入站 packet，连接关闭后自动提升剩余路径。
+- SDK 收到无 live connection owner 的 non-OPEN Relay 帧时，TUN 记录 quoted `relay_id` 和 `kind`；日志不包含 payload、session 或凭据。
 - 每个 peer 使用独立的数据面状态；可通过 `peers[].transport_mode` 在同一进程内混用 Relay 和 stream，单个 peer 的 stream 建连、重试或拥塞不会切换其他 peer 的传输模式。
 - TUN MTU 应按实际出口和 turntf 封装开销选择。默认 `1400`，部署后可通过吞吐、丢包和长尾测试调整。
 

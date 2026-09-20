@@ -401,10 +401,18 @@ func (r *Runtime) activateStream(peer turntf.UserRef, stream *streamPort) {
 		r.activeStreams = make(map[turntf.UserRef]*streamPort)
 	}
 	r.activeStreams[peer] = stream
-	relay := r.ports[peer]
+	connections := r.relayPorts[peer]
+	var relays []*peerPort
+	for _, relay := range connections {
+		relays = append(relays, relay)
+	}
+	if len(relays) == 0 && r.ports[peer] != nil {
+		relays = append(relays, r.ports[peer])
+	}
+	delete(r.relayPorts, peer)
 	delete(r.ports, peer)
 	r.mu.Unlock()
-	if relay != nil {
+	for _, relay := range relays {
 		relay.close()
 	}
 }
@@ -518,6 +526,11 @@ func (runtimeHandler) OnMessage(context.Context, turntf.Message) {}
 func (runtimeHandler) OnPacket(context.Context, turntf.Packet)   {}
 func (runtimeHandler) OnError(context.Context, error)            {}
 func (runtimeHandler) OnDisconnect(context.Context, error)       {}
+func (h runtimeHandler) OnRelayOrphan(_ context.Context, relayID string, kind turntf.RelayKind) {
+	if h.runtime != nil {
+		h.runtime.logRelayOrphan(relayID, kind)
+	}
+}
 func (h runtimeHandler) OnStream(ctx context.Context, packet turntf.Packet, frame turntf.StreamFrame) {
 	if h.runtime == nil {
 		return

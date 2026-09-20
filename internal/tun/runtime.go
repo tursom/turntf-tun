@@ -68,6 +68,7 @@ type Runtime struct {
 	routes           *routeTable
 	mu               sync.RWMutex
 	ports            map[turntf.UserRef]*peerPort
+	relayPorts       map[turntf.UserRef]map[string]*peerPort
 	activeStreams    map[turntf.UserRef]*streamPort
 	writeMu          sync.Mutex
 	streamMu         sync.RWMutex
@@ -144,7 +145,7 @@ func NewRuntime(cfg Config, device PacketDevice, routes *routeTable, logger Logg
 	relayCfg.DeliveryMode = turntf.DeliveryModeBestEffort
 	relayCfg.WindowSize = cfg.Transport.RelayWindowSize
 	relayCfg.SendBufferSize = relaySendBufferBytes
-	rt := &Runtime{cfg: cfg, logger: logger, device: device, routes: routes, relayCfg: relayCfg, ports: make(map[turntf.UserRef]*peerPort), activeStreams: make(map[turntf.UserRef]*streamPort), streamPorts: make(map[turntf.UserRef]*streamPort), streamRecv: make(map[turntf.StreamID]*streamReceiver), preferredStreams: make(map[turntf.UserRef]turntf.SessionRef)}
+	rt := &Runtime{cfg: cfg, logger: logger, device: device, routes: routes, relayCfg: relayCfg, ports: make(map[turntf.UserRef]*peerPort), relayPorts: make(map[turntf.UserRef]map[string]*peerPort), activeStreams: make(map[turntf.UserRef]*streamPort), streamPorts: make(map[turntf.UserRef]*streamPort), streamRecv: make(map[turntf.StreamID]*streamReceiver), preferredStreams: make(map[turntf.UserRef]turntf.SessionRef)}
 	client, err := turntf.NewClient(turntf.Config{BaseURL: cfg.Turntf.BaseURL, Credentials: credentials, CursorStore: turntf.NewMemoryCursorStore(), Handler: runtimeHandler{runtime: rt}, RequestTimeout: cfg.Turntf.RequestTimeout.Duration, PingInterval: cfg.Turntf.PingInterval.Duration, TransientOnly: true, RealtimeStream: true})
 	if err != nil {
 		return nil, err
@@ -282,28 +283,55 @@ func (r *Runtime) registerPort(ctx context.Context, peer PeerConfig, conn relayC
 		p.close()
 		return p
 	}
-	old := r.ports[user]
-	if old != nil && old.conn.RelayID() <= conn.RelayID() {
+	if r.relayPorts == nil {
+		r.relayPorts = make(map[turntf.UserRef]map[string]*peerPort)
+	}
+	connections := r.relayPorts[user]
+	if connections == nil {
+		connections = make(map[string]*peerPort)
+		r.relayPorts[user] = connections
+	}
+	if connections[conn.RelayID()] != nil {
 		r.mu.Unlock()
 		p.close()
 		return p
 	}
-	r.ports[user] = p
-	r.mu.Unlock()
-	if old != nil {
-		old.close()
+	connections[conn.RelayID()] = p
+	selected := r.ports[user]
+	if selected == nil || conn.RelayID() < selected.conn.RelayID() {
+		r.ports[user] = p
 	}
+	r.mu.Unlock()
+
+	conn.OnClose(func(error) { r.unregisterPort(user, p) })
 	go r.writeRelayLoop(p)
 	go r.readRelayLoop(ctx, p)
-	conn.OnClose(func(error) {
-		r.mu.Lock()
-		if r.ports[user] == p {
-			delete(r.ports, user)
-		}
-		r.mu.Unlock()
-		p.once.Do(func() { close(p.done) })
-	})
 	return p
+}
+
+// unregisterPort removes only the connection that closed. Non-selected
+// connections remain receive-capable and the lowest live relay ID becomes the
+// next outbound path without aborting any other session's path.
+func (r *Runtime) unregisterPort(user turntf.UserRef, p *peerPort) {
+	r.mu.Lock()
+	connections := r.relayPorts[user]
+	if connections[p.conn.RelayID()] == p {
+		delete(connections, p.conn.RelayID())
+	}
+	if len(connections) == 0 {
+		delete(r.relayPorts, user)
+	}
+	if r.ports[user] == p {
+		delete(r.ports, user)
+		for _, candidate := range connections {
+			selected := r.ports[user]
+			if selected == nil || candidate.conn.RelayID() < selected.conn.RelayID() {
+				r.ports[user] = candidate
+			}
+		}
+	}
+	r.mu.Unlock()
+	p.once.Do(func() { close(p.done) })
 }
 func (r *Runtime) writeRelayLoop(p *peerPort) {
 	var pending []byte
@@ -381,9 +409,18 @@ func (r *Runtime) readRelayLoop(ctx context.Context, p *peerPort) {
 }
 func (r *Runtime) closePorts() {
 	r.mu.Lock()
-	ports := make([]*peerPort, 0, len(r.ports))
+	seen := make(map[*peerPort]struct{})
+	var ports []*peerPort
+	for _, connections := range r.relayPorts {
+		for _, p := range connections {
+			seen[p] = struct{}{}
+			ports = append(ports, p)
+		}
+	}
 	for _, p := range r.ports {
-		ports = append(ports, p)
+		if _, ok := seen[p]; !ok {
+			ports = append(ports, p)
+		}
 	}
 	r.mu.Unlock()
 	for _, p := range ports {
@@ -413,6 +450,31 @@ func sleepContext(ctx context.Context, d time.Duration) bool {
 		return true
 	}
 }
+func (r *Runtime) logRelayOrphan(relayID string, kind turntf.RelayKind) {
+	r.logf("orphan relay frame relay_id=%q kind=%s", relayID, relayKindName(kind))
+}
+
+func relayKindName(kind turntf.RelayKind) string {
+	switch kind {
+	case turntf.RelayKindOpen:
+		return "OPEN"
+	case turntf.RelayKindOpenAck:
+		return "OPEN_ACK"
+	case turntf.RelayKindData:
+		return "DATA"
+	case turntf.RelayKindAck:
+		return "ACK"
+	case turntf.RelayKindClose:
+		return "CLOSE"
+	case turntf.RelayKindPing:
+		return "PING"
+	case turntf.RelayKindError:
+		return "ERROR"
+	default:
+		return "UNSPECIFIED"
+	}
+}
+
 func (r *Runtime) logf(format string, args ...any) {
 	if r.logger != nil {
 		r.logger.Printf(format, args...)
