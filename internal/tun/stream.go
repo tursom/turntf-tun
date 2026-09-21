@@ -290,7 +290,7 @@ func (r *Runtime) streamLoop(ctx context.Context, peer PeerConfig) {
 	}
 	defer stopFallback()
 	for ctx.Err() == nil {
-		switch r.runStream(ctx, peer, stopFallback) {
+		switch r.runStream(ctx, peer, stopFallback, startFallback) {
 		case streamRunRestart:
 			continue
 		case streamRunFallback:
@@ -304,7 +304,7 @@ func (r *Runtime) streamLoop(ctx context.Context, peer PeerConfig) {
 	}
 }
 
-func (r *Runtime) runStream(ctx context.Context, peer PeerConfig, streamReady func()) streamRunResult {
+func (r *Runtime) runStream(ctx context.Context, peer PeerConfig, streamReady, streamLost func()) streamRunResult {
 	target := peer.User.ToTurntf()
 	r.streamMu.RLock()
 	targetSession := r.preferredStreams[target]
@@ -389,12 +389,20 @@ func (r *Runtime) runStream(ctx context.Context, peer PeerConfig, streamReady fu
 			}
 			return streamRunStopped
 		case <-port.lost:
+			if active {
+				r.deactivateStream(target, port)
+				active = false
+			}
+			streamLost()
 			if !r.recoverStream(port.ctx, peer, port) {
 				if ctx.Err() != nil {
 					return streamRunStopped
 				}
 				return streamRunRestart
 			}
+			r.activateStream(target, port)
+			active = true
+			streamReady()
 		}
 	}
 }
