@@ -137,11 +137,15 @@ func (p *streamPort) markReady(err error) {
 }
 func (p *streamPort) markPathLost() {
 	p.pathMu.Lock()
-	if p.readyState {
+	wasReady := p.readyState
+	if wasReady {
 		p.readyState = false
 		p.ready = make(chan struct{})
 	}
 	p.pathMu.Unlock()
+	if !wasReady {
+		return
+	}
 	select {
 	case p.lost <- struct{}{}:
 	default:
@@ -519,13 +523,36 @@ type streamReceiver struct {
 	receivedOnce  sync.Once
 }
 
+func (r *Runtime) markAllStreamPathsLost(reason error) {
+	r.streamMu.RLock()
+	ports := make([]*streamPort, 0, len(r.streamPorts))
+	for _, port := range r.streamPorts {
+		ports = append(ports, port)
+	}
+	r.streamMu.RUnlock()
+	for _, port := range ports {
+		port.markPathLost()
+	}
+	if len(ports) > 0 && reason != nil {
+		r.logf("stream transport invalidated %d paths: %v", len(ports), reason)
+	}
+}
+
 type runtimeHandler struct{ runtime *Runtime }
 
 func (runtimeHandler) OnLogin(context.Context, turntf.LoginInfo) {}
 func (runtimeHandler) OnMessage(context.Context, turntf.Message) {}
 func (runtimeHandler) OnPacket(context.Context, turntf.Packet)   {}
-func (runtimeHandler) OnError(context.Context, error)            {}
-func (runtimeHandler) OnDisconnect(context.Context, error)       {}
+func (h runtimeHandler) OnError(_ context.Context, err error) {
+	if h.runtime != nil {
+		h.runtime.markAllStreamPathsLost(err)
+	}
+}
+func (h runtimeHandler) OnDisconnect(_ context.Context, err error) {
+	if h.runtime != nil {
+		h.runtime.markAllStreamPathsLost(err)
+	}
+}
 func (h runtimeHandler) OnRelayOrphan(_ context.Context, relayID string, kind turntf.RelayKind) {
 	if h.runtime != nil {
 		h.runtime.logRelayOrphan(relayID, kind)

@@ -281,6 +281,38 @@ func TestStreamPortResumeKeepsIDAndPendingSuffix(t *testing.T) {
 	}
 }
 
+func TestRuntimeHandlerInvalidatesReadyStreamsOnce(t *testing.T) {
+	firstPeer := turntf.UserRef{NodeID: 2, UserID: 3}
+	secondPeer := turntf.UserRef{NodeID: 4, UserID: 5}
+	first := testStreamPort()
+	second := testStreamPort()
+	for _, port := range []*streamPort{first, second} {
+		port.readyState = true
+		close(port.ready)
+	}
+	r := &Runtime{streamPorts: map[turntf.UserRef]*streamPort{firstPeer: first, secondPeer: second}}
+	h := runtimeHandler{runtime: r}
+	h.OnError(context.Background(), errors.New("stream target session unavailable"))
+	for peer, port := range map[turntf.UserRef]*streamPort{firstPeer: first, secondPeer: second} {
+		select {
+		case <-port.lost:
+		default:
+			t.Fatalf("peer %v path loss was not signaled", peer)
+		}
+		if port.readyState {
+			t.Fatalf("peer %v remained ready", peer)
+		}
+	}
+	h.OnDisconnect(context.Background(), errors.New("websocket disconnected"))
+	for peer, port := range map[turntf.UserRef]*streamPort{firstPeer: first, secondPeer: second} {
+		select {
+		case <-port.lost:
+			t.Fatalf("peer %v received duplicate path-loss signal", peer)
+		default:
+		}
+	}
+}
+
 func TestStreamPortPathLossPreservesQueueAndSignalsRecovery(t *testing.T) {
 	p := testStreamPort()
 	p.readyState = true
@@ -305,6 +337,58 @@ func TestStreamPortPathLossPreservesQueueAndSignalsRecovery(t *testing.T) {
 type sentStreamFrame struct {
 	session turntf.SessionRef
 	frame   turntf.StreamFrame
+}
+
+func TestRecoverStreamResolvesCurrentSessionAfterAsyncError(t *testing.T) {
+	peerRef := turntf.UserRef{NodeID: 20, UserID: 30}
+	peer := PeerConfig{Name: "peer", User: UserRefConfig{NodeID: peerRef.NodeID, UserID: peerRef.UserID}}
+	oldSession := turntf.SessionRef{ServingNodeID: 40, SessionID: "old-session"}
+	newSession := turntf.SessionRef{ServingNodeID: 41, SessionID: "new-session"}
+	port := testStreamPort()
+	port.peer = peerRef
+	port.targetSession = oldSession
+	port.readyState = true
+	close(port.ready)
+	pending, err := port.sender.Data([]byte("pending"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var sent []sentStreamFrame
+	r := &Runtime{
+		cfg:         Config{Transport: TransportConfig{DialRetryInterval: Duration{Duration: time.Millisecond}}},
+		streamPorts: map[turntf.UserRef]*streamPort{peerRef: port},
+		streamResolve: func(context.Context, turntf.UserRef) (turntf.ResolvedUserSessions, error) {
+			return turntf.ResolvedUserSessions{Sessions: []turntf.ResolvedSession{{Session: newSession, TransientCapable: true}}}, nil
+		},
+		streamSend: func(_ context.Context, _ turntf.UserRef, target turntf.SessionRef, frame turntf.StreamFrame, _ turntf.DeliveryMode) (turntf.RelayAccepted, error) {
+			mu.Lock()
+			sent = append(sent, sentStreamFrame{session: target, frame: frame})
+			mu.Unlock()
+			if frame.Kind == turntf.StreamFrameResume {
+				go port.acknowledge(turntf.StreamFrame{Kind: turntf.StreamFrameAck, ID: port.id, Epoch: frame.Epoch, Offset: pending.Offset + uint64(len(pending.Payload)), Window: turntf.DefaultStreamWindow})
+			}
+			return turntf.RelayAccepted{}, nil
+		},
+	}
+	runtimeHandler{runtime: r}.OnError(context.Background(), errors.New("stream target session unavailable"))
+	select {
+	case <-port.lost:
+	default:
+		t.Fatal("asynchronous server error did not signal recovery")
+	}
+	if !r.recoverStream(context.Background(), peer, port) {
+		t.Fatal("stream recovery failed")
+	}
+	session, ready := port.currentPath()
+	if session != newSession || !port.isReady(ready) {
+		t.Fatalf("recovered path = (%+v, ready=%v), want new session", session, port.isReady(ready))
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(sent) < 2 || sent[0].frame.Kind != turntf.StreamFrameResume || sent[0].session != newSession || sent[1].frame.Kind != turntf.StreamFrameData || sent[1].session != newSession {
+		t.Fatalf("recovery frames = %+v", sent)
+	}
 }
 
 func TestReciprocalStreamOpenWithUnchangedSessionDoesNotRestart(t *testing.T) {
@@ -352,7 +436,6 @@ func TestReciprocalStreamOpenWithUnchangedSessionDoesNotRestart(t *testing.T) {
 }
 
 func TestStreamOpenSessionChangeRebuildsOutboundOnce(t *testing.T) {
-	t.Skip("session changes are handled by outbound OpenAck/send failure, not inbound Open")
 	peerRef := turntf.UserRef{NodeID: 20, UserID: 30}
 	peer := PeerConfig{Name: "peer", User: UserRefConfig{NodeID: peerRef.NodeID, UserID: peerRef.UserID}}
 	oldSession := turntf.SessionRef{ServingNodeID: 40, SessionID: "old-session"}
@@ -456,8 +539,8 @@ func TestStreamOpenSessionChangeRebuildsOutboundOnce(t *testing.T) {
 			openCount++
 		}
 	}
-	if resolveCount != 2 || openCount != 2 {
-		t.Fatalf("resolve count = %d, Open count = %d, want 2 and 2", resolveCount, openCount)
+	if resolveCount != 1 || openCount != 2 {
+		t.Fatalf("resolve count = %d, Open count = %d, want 1 and 2; observed inbound session should be reused", resolveCount, openCount)
 	}
 }
 
