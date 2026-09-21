@@ -254,7 +254,8 @@ func (r *Runtime) sendStreamFrame(ctx context.Context, peer turntf.UserRef, sess
 	if r.streamSend != nil {
 		return r.streamSend(ctx, peer, session, frame, turntf.DeliveryModeRouteRetry)
 	}
-	return r.client.SendStreamFrame(ctx, peer, session, frame, turntf.DeliveryModeRouteRetry)
+	_, err := r.client.SendStreamFrameTracked(ctx, peer, session, frame, turntf.DeliveryModeRouteRetry)
+	return turntf.RelayAccepted{}, err
 }
 
 func (r *Runtime) newStreamID() (turntf.StreamID, error) {
@@ -553,13 +554,36 @@ func (runtimeHandler) OnMessage(context.Context, turntf.Message) {}
 func (runtimeHandler) OnPacket(context.Context, turntf.Packet)   {}
 func (h runtimeHandler) OnError(_ context.Context, err error) {
 	if h.runtime != nil {
-		h.runtime.markAllStreamPathsLost(err)
+		h.runtime.logf("turntf client error: %v", err)
 	}
 }
 func (h runtimeHandler) OnDisconnect(_ context.Context, err error) {
 	if h.runtime != nil {
 		h.runtime.markAllStreamPathsLost(err)
 	}
+}
+func (h runtimeHandler) OnStreamSendResult(_ context.Context, result turntf.StreamSendResult) {
+	if h.runtime == nil || result.Err == nil {
+		return
+	}
+	r := h.runtime
+	peer := result.Metadata.Target
+	failedSession := result.Metadata.TargetSession
+	r.streamMu.Lock()
+	if r.preferredStreams[peer] == failedSession {
+		delete(r.preferredStreams, peer)
+	}
+	port := r.streamPorts[peer]
+	r.streamMu.Unlock()
+	if port == nil {
+		return
+	}
+	currentSession, _ := port.currentPath()
+	if currentSession != failedSession {
+		return
+	}
+	r.logf("stream send to %d:%d session=%d/%s failed: %v", peer.NodeID, peer.UserID, failedSession.ServingNodeID, failedSession.SessionID, result.Err)
+	port.markPathLost()
 }
 func (h runtimeHandler) OnRelayOrphan(_ context.Context, relayID string, kind turntf.RelayKind) {
 	if h.runtime != nil {
@@ -659,3 +683,4 @@ func (h runtimeHandler) OnStream(ctx context.Context, packet turntf.Packet, fram
 }
 
 var _ turntf.StreamHandler = runtimeHandler{}
+var _ turntf.StreamSendHandler = runtimeHandler{}

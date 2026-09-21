@@ -281,7 +281,7 @@ func TestStreamPortResumeKeepsIDAndPendingSuffix(t *testing.T) {
 	}
 }
 
-func TestRuntimeHandlerInvalidatesReadyStreamsOnce(t *testing.T) {
+func TestRuntimeDisconnectInvalidatesReadyStreamsOnce(t *testing.T) {
 	firstPeer := turntf.UserRef{NodeID: 2, UserID: 3}
 	secondPeer := turntf.UserRef{NodeID: 4, UserID: 5}
 	first := testStreamPort()
@@ -292,7 +292,7 @@ func TestRuntimeHandlerInvalidatesReadyStreamsOnce(t *testing.T) {
 	}
 	r := &Runtime{streamPorts: map[turntf.UserRef]*streamPort{firstPeer: first, secondPeer: second}}
 	h := runtimeHandler{runtime: r}
-	h.OnError(context.Background(), errors.New("stream target session unavailable"))
+	h.OnDisconnect(context.Background(), errors.New("websocket disconnected"))
 	for peer, port := range map[turntf.UserRef]*streamPort{firstPeer: first, secondPeer: second} {
 		select {
 		case <-port.lost:
@@ -303,13 +303,91 @@ func TestRuntimeHandlerInvalidatesReadyStreamsOnce(t *testing.T) {
 			t.Fatalf("peer %v remained ready", peer)
 		}
 	}
-	h.OnDisconnect(context.Background(), errors.New("websocket disconnected"))
+	h.OnDisconnect(context.Background(), errors.New("duplicate websocket disconnect"))
 	for peer, port := range map[turntf.UserRef]*streamPort{firstPeer: first, secondPeer: second} {
 		select {
 		case <-port.lost:
 			t.Fatalf("peer %v received duplicate path-loss signal", peer)
 		default:
 		}
+	}
+}
+
+func TestTrackedStreamErrorInvalidatesOnlyMatchingPeerSession(t *testing.T) {
+	failedPeer := turntf.UserRef{NodeID: 2, UserID: 3}
+	healthyPeer := turntf.UserRef{NodeID: 4, UserID: 5}
+	failedSession := turntf.SessionRef{ServingNodeID: 6, SessionID: "failed"}
+	healthySession := turntf.SessionRef{ServingNodeID: 7, SessionID: "healthy"}
+	failed := testStreamPort()
+	failed.peer = failedPeer
+	failed.targetSession = failedSession
+	healthy := testStreamPort()
+	healthy.peer = healthyPeer
+	healthy.targetSession = healthySession
+	for _, port := range []*streamPort{failed, healthy} {
+		port.readyState = true
+		close(port.ready)
+	}
+	r := &Runtime{
+		streamPorts: map[turntf.UserRef]*streamPort{failedPeer: failed, healthyPeer: healthy},
+		preferredStreams: map[turntf.UserRef]turntf.SessionRef{
+			failedPeer:  failedSession,
+			healthyPeer: healthySession,
+		},
+	}
+	h := runtimeHandler{runtime: r}
+	h.OnStreamSendResult(context.Background(), turntf.StreamSendResult{
+		RequestID: 1,
+		Metadata:  turntf.StreamSendMetadata{Target: failedPeer, TargetSession: failedSession, StreamID: failed.id, Kind: turntf.StreamFrameData},
+		Err:       errors.New("stream target session unavailable"),
+	})
+	select {
+	case <-failed.lost:
+	default:
+		t.Fatal("matching peer path loss was not signaled")
+	}
+	if failed.readyState {
+		t.Fatal("matching peer remained ready")
+	}
+	select {
+	case <-healthy.lost:
+		t.Fatal("healthy peer was invalidated by another peer's send error")
+	default:
+	}
+	if !healthy.readyState {
+		t.Fatal("healthy peer was marked not ready")
+	}
+	r.streamMu.RLock()
+	_, failedPreferred := r.preferredStreams[failedPeer]
+	gotHealthy := r.preferredStreams[healthyPeer]
+	r.streamMu.RUnlock()
+	if failedPreferred || gotHealthy != healthySession {
+		t.Fatalf("preferred sessions after failure: failed_present=%v healthy=%+v", failedPreferred, gotHealthy)
+	}
+}
+
+func TestTrackedStreamErrorForOldSessionDoesNotInvalidateNewPath(t *testing.T) {
+	peer := turntf.UserRef{NodeID: 2, UserID: 3}
+	oldSession := turntf.SessionRef{ServingNodeID: 6, SessionID: "old"}
+	newSession := turntf.SessionRef{ServingNodeID: 6, SessionID: "new"}
+	port := testStreamPort()
+	port.peer = peer
+	port.targetSession = newSession
+	port.readyState = true
+	close(port.ready)
+	r := &Runtime{streamPorts: map[turntf.UserRef]*streamPort{peer: port}, preferredStreams: map[turntf.UserRef]turntf.SessionRef{peer: newSession}}
+	runtimeHandler{runtime: r}.OnStreamSendResult(context.Background(), turntf.StreamSendResult{
+		RequestID: 2,
+		Metadata:  turntf.StreamSendMetadata{Target: peer, TargetSession: oldSession, StreamID: port.id, Kind: turntf.StreamFrameData},
+		Err:       errors.New("late error from old session"),
+	})
+	select {
+	case <-port.lost:
+		t.Fatal("late old-session error invalidated current path")
+	default:
+	}
+	if !port.readyState {
+		t.Fatal("current path was marked not ready")
 	}
 }
 
@@ -371,7 +449,11 @@ func TestRecoverStreamResolvesCurrentSessionAfterAsyncError(t *testing.T) {
 			return turntf.RelayAccepted{}, nil
 		},
 	}
-	runtimeHandler{runtime: r}.OnError(context.Background(), errors.New("stream target session unavailable"))
+	runtimeHandler{runtime: r}.OnStreamSendResult(context.Background(), turntf.StreamSendResult{
+		RequestID: 3,
+		Metadata:  turntf.StreamSendMetadata{Target: peerRef, TargetSession: oldSession, StreamID: port.id, Kind: turntf.StreamFrameData},
+		Err:       errors.New("stream target session unavailable"),
+	})
 	select {
 	case <-port.lost:
 	default:
