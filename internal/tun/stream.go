@@ -96,7 +96,7 @@ type streamPort struct {
 	epoch         uint64
 	lastAck       uint64
 	pathMu        sync.Mutex
-	openErr       chan error
+	attemptErr    chan error
 	ctx           context.Context
 	cancel        context.CancelFunc
 	done          chan struct{}
@@ -120,20 +120,43 @@ func (p *streamPort) enqueue(packet []byte) bool {
 		return false
 	}
 }
-func (p *streamPort) markReady(err error) {
-	if err != nil {
+func (p *streamPort) beginOpen(session turntf.SessionRef) (<-chan struct{}, <-chan error) {
+	p.pathMu.Lock()
+	defer p.pathMu.Unlock()
+	p.targetSession = session
+	p.readyState = false
+	p.ready = make(chan struct{})
+	p.resumeReady = nil
+	p.attemptErr = make(chan error, 1)
+	return p.ready, p.attemptErr
+}
+func (p *streamPort) acceptOpenAck(session turntf.SessionRef, epoch uint64) bool {
+	p.pathMu.Lock()
+	defer p.pathMu.Unlock()
+	if p.targetSession != session || p.epoch != epoch || p.readyState {
+		return false
+	}
+	p.readyState = true
+	close(p.ready)
+	return true
+}
+func (p *streamPort) failPath(session turntf.SessionRef, err error) bool {
+	p.pathMu.Lock()
+	if p.targetSession != session {
+		p.pathMu.Unlock()
+		return false
+	}
+	if !p.readyState {
 		select {
-		case p.openErr <- err:
+		case p.attemptErr <- err:
 		default:
 		}
-		return
-	}
-	p.pathMu.Lock()
-	if !p.readyState {
-		p.readyState = true
-		close(p.ready)
+		p.pathMu.Unlock()
+		return true
 	}
 	p.pathMu.Unlock()
+	p.markPathLost()
+	return true
 }
 func (p *streamPort) markPathLost() {
 	p.pathMu.Lock()
@@ -151,7 +174,7 @@ func (p *streamPort) markPathLost() {
 	default:
 	}
 }
-func (p *streamPort) beginResume(session turntf.SessionRef, epoch uint64) (uint64, chan struct{}) {
+func (p *streamPort) beginResume(session turntf.SessionRef, epoch uint64) (uint64, <-chan struct{}, <-chan error) {
 	p.pathMu.Lock()
 	defer p.pathMu.Unlock()
 	p.targetSession = session
@@ -159,12 +182,8 @@ func (p *streamPort) beginResume(session turntf.SessionRef, epoch uint64) (uint6
 	p.readyState = false
 	p.ready = make(chan struct{})
 	p.resumeReady = make(chan struct{}, 1)
-	return p.lastAck, p.resumeReady
-}
-func (p *streamPort) setOpenSession(session turntf.SessionRef) {
-	p.pathMu.Lock()
-	p.targetSession = session
-	p.pathMu.Unlock()
+	p.attemptErr = make(chan error, 1)
+	return p.lastAck, p.resumeReady, p.attemptErr
 }
 func (p *streamPort) currentPath() (turntf.SessionRef, <-chan struct{}) {
 	p.pathMu.Lock()
@@ -181,10 +200,10 @@ func (p *streamPort) isReady(channel <-chan struct{}) bool {
 	defer p.pathMu.Unlock()
 	return p.readyState && p.ready == channel
 }
-func (p *streamPort) acknowledge(frame turntf.StreamFrame) {
+func (p *streamPort) acknowledge(session turntf.SessionRef, frame turntf.StreamFrame) {
 	p.pathMu.Lock()
 	defer p.pathMu.Unlock()
-	if frame.Epoch != p.epoch {
+	if session != p.targetSession || frame.Epoch != p.epoch {
 		return
 	}
 	_ = p.sender.Acknowledge(frame.Epoch, frame.Offset, frame.Window)
@@ -265,6 +284,29 @@ func (r *Runtime) newStreamID() (turntf.StreamID, error) {
 	return turntf.NewStreamID()
 }
 
+func (r *Runtime) streamAttemptTimeout() time.Duration {
+	if r.streamTimeout > 0 {
+		return r.streamTimeout
+	}
+	return streamOpenTimeout
+}
+
+func transientStreamSessions(sessions turntf.ResolvedUserSessions) []turntf.SessionRef {
+	result := make([]turntf.SessionRef, 0, len(sessions.Sessions))
+	seen := make(map[turntf.SessionRef]struct{}, len(sessions.Sessions))
+	for _, candidate := range sessions.Sessions {
+		if !candidate.TransientCapable || candidate.Session.IsZero() {
+			continue
+		}
+		if _, ok := seen[candidate.Session]; ok {
+			continue
+		}
+		seen[candidate.Session] = struct{}{}
+		result = append(result, candidate.Session)
+	}
+	return result
+}
+
 func (r *Runtime) streamLoop(ctx context.Context, peer PeerConfig) {
 	var fallbackCancel context.CancelFunc
 	var fallbackDone chan struct{}
@@ -308,22 +350,20 @@ func (r *Runtime) streamLoop(ctx context.Context, peer PeerConfig) {
 func (r *Runtime) runStream(ctx context.Context, peer PeerConfig, streamReady, streamLost func()) streamRunResult {
 	target := peer.User.ToTurntf()
 	r.streamMu.RLock()
-	targetSession := r.preferredStreams[target]
+	preferredSession := r.preferredStreams[target]
 	r.streamMu.RUnlock()
-	if targetSession.IsZero() {
+	var candidates []turntf.SessionRef
+	if preferredSession.IsZero() {
 		sessions, err := r.resolveStreamSessions(ctx, target)
 		if err != nil {
 			r.logf("resolve stream peer %s: %v", peer.Name, err)
 			return streamRunFallback
 		}
-		for _, candidate := range sessions.Sessions {
-			if candidate.TransientCapable {
-				targetSession = candidate.Session
-				break
-			}
-		}
+		candidates = transientStreamSessions(sessions)
+	} else {
+		candidates = []turntf.SessionRef{preferredSession}
 	}
-	if targetSession.IsZero() {
+	if len(candidates) == 0 {
 		r.logf("stream peer %s has no transient session", peer.Name)
 		return streamRunFallback
 	}
@@ -332,7 +372,7 @@ func (r *Runtime) runStream(ctx context.Context, peer PeerConfig, streamReady, s
 		return streamRunFallback
 	}
 	portCtx, cancel := context.WithCancel(ctx)
-	port := &streamPort{runtime: r, peer: target, id: id, targetSession: targetSession, sender: turntf.NewStreamSenderState(id, 1, turntf.DefaultStreamWindow), queue: make(chan []byte, r.cfg.Transport.SendQueueSize), ready: make(chan struct{}), lost: make(chan struct{}, 1), epoch: 1, openErr: make(chan error, 1), ctx: portCtx, cancel: cancel, done: make(chan struct{}), restart: make(chan struct{})}
+	port := &streamPort{runtime: r, peer: target, id: id, sender: turntf.NewStreamSenderState(id, 1, turntf.DefaultStreamWindow), queue: make(chan []byte, r.cfg.Transport.SendQueueSize), ready: make(chan struct{}), lost: make(chan struct{}, 1), epoch: 1, attemptErr: make(chan error, 1), ctx: portCtx, cancel: cancel, done: make(chan struct{}), restart: make(chan struct{})}
 	active := false
 	r.streamMu.Lock()
 	old := r.streamPorts[target]
@@ -353,26 +393,51 @@ func (r *Runtime) runStream(ctx context.Context, peer PeerConfig, streamReady, s
 		old.close()
 	}
 	open := turntf.StreamFrame{Kind: turntf.StreamFrameOpen, ID: id, Epoch: 1, Window: turntf.DefaultStreamWindow}
-	if _, err := r.sendStreamFrame(port.ctx, target, targetSession, open); err != nil {
-		return streamRunFallback
-	}
-	select {
-	case <-port.openErr:
-		r.logf("stream peer %s open rejected", peer.Name)
-		return streamRunFallback
-	case <-time.After(streamOpenTimeout):
-		r.logf("stream peer %s open timeout", peer.Name)
-		return streamRunFallback
-	case <-port.ready:
-	case <-port.restart:
-		return streamRunRestart
-	case <-port.done:
-		if port.restartRequested() {
-			return streamRunRestart
+	opened := false
+	for _, candidate := range candidates {
+		ready, attemptErr := port.beginOpen(candidate)
+		if _, err := r.sendStreamFrame(port.ctx, target, candidate, open); err != nil {
+			r.logf("stream peer %s open session=%d/%s failed: %v", peer.Name, candidate.ServingNodeID, candidate.SessionID, err)
+			continue
 		}
-		return streamRunStopped
-	case <-ctx.Done():
-		return streamRunStopped
+		timer := time.NewTimer(r.streamAttemptTimeout())
+		select {
+		case err := <-attemptErr:
+			timer.Stop()
+			r.logf("stream peer %s open session=%d/%s rejected: %v", peer.Name, candidate.ServingNodeID, candidate.SessionID, err)
+			continue
+		case <-timer.C:
+			r.logf("stream peer %s open session=%d/%s timeout", peer.Name, candidate.ServingNodeID, candidate.SessionID)
+			continue
+		case <-ready:
+			timer.Stop()
+			opened = true
+		case <-port.restart:
+			timer.Stop()
+			return streamRunRestart
+		case <-port.done:
+			timer.Stop()
+			if port.restartRequested() {
+				return streamRunRestart
+			}
+			return streamRunStopped
+		case <-ctx.Done():
+			timer.Stop()
+			return streamRunStopped
+		}
+		if opened {
+			break
+		}
+	}
+	if !opened {
+		if !preferredSession.IsZero() {
+			r.streamMu.Lock()
+			if r.preferredStreams[target] == preferredSession {
+				delete(r.preferredStreams, target)
+			}
+			r.streamMu.Unlock()
+		}
+		return streamRunFallback
 	}
 	r.activateStream(target, port)
 	active = true
@@ -429,36 +494,36 @@ func (r *Runtime) recoverStream(ctx context.Context, peer PeerConfig, p *streamP
 	for ctx.Err() == nil {
 		sessions, err := r.resolveStreamSessions(ctx, p.peer)
 		if err == nil {
-			for _, candidate := range sessions.Sessions {
-				if !candidate.TransientCapable {
-					continue
-				}
+			for _, session := range transientStreamSessions(sessions) {
 				epoch := p.nextEpoch()
-				lastAck, resumeReady := p.beginResume(candidate.Session, epoch)
+				lastAck, resumeReady, attemptErr := p.beginResume(session, epoch)
 				frames, resumeErr := p.sender.Resume(epoch, lastAck)
 				if resumeErr != nil {
 					return false
 				}
 				resume := turntf.StreamFrame{Kind: turntf.StreamFrameResume, ID: p.id, Epoch: epoch, Offset: lastAck}
-				if _, err = r.sendStreamFrame(ctx, p.peer, candidate.Session, resume); err != nil {
-					break
+				if _, err = r.sendStreamFrame(ctx, p.peer, session, resume); err != nil {
+					continue
 				}
+				timer := time.NewTimer(r.streamAttemptTimeout())
 				select {
 				case <-resumeReady:
+					timer.Stop()
 					for _, frame := range frames {
-						if _, err = r.sendStreamFrame(ctx, p.peer, candidate.Session, frame); err != nil {
+						if _, err = r.sendStreamFrame(ctx, p.peer, session, frame); err != nil {
 							break
 						}
 					}
 					if err == nil {
 						return true
 					}
-				case <-time.After(streamOpenTimeout):
-					return false
+				case <-attemptErr:
+					timer.Stop()
+				case <-timer.C:
 				case <-ctx.Done():
+					timer.Stop()
 					return false
 				}
-				break
 			}
 		}
 		if !sleepContext(ctx, r.cfg.Transport.DialRetryInterval.Duration) {
@@ -516,7 +581,23 @@ type streamReceiver struct {
 	peer          turntf.UserRef
 	targetSession turntf.SessionRef
 	state         *turntf.StreamReceiverState
+	pathMu        sync.RWMutex
 	receivedOnce  sync.Once
+}
+
+func (r *streamReceiver) session() turntf.SessionRef {
+	r.pathMu.RLock()
+	defer r.pathMu.RUnlock()
+	return r.targetSession
+}
+
+func (r *streamReceiver) setSession(session turntf.SessionRef) {
+	if session.IsZero() {
+		return
+	}
+	r.pathMu.Lock()
+	r.targetSession = session
+	r.pathMu.Unlock()
 }
 
 func (r *Runtime) closeRelayPeer(peer turntf.UserRef) {
@@ -581,13 +662,11 @@ func (h runtimeHandler) OnStreamSendResult(_ context.Context, result turntf.Stre
 	if port == nil {
 		return
 	}
-	currentSession, _ := port.currentPath()
-	if currentSession != failedSession {
+	if !port.failPath(failedSession, result.Err) {
 		return
 	}
 	r.logf("stream send to %d:%d session=%d/%s failed: %v", peer.NodeID, peer.UserID, failedSession.ServingNodeID, failedSession.SessionID, result.Err)
 	r.closeRelayPeer(peer)
-	port.markPathLost()
 }
 func (h runtimeHandler) OnRelayOrphan(_ context.Context, relayID string, kind turntf.RelayKind) {
 	if h.runtime != nil {
@@ -612,6 +691,8 @@ func (h runtimeHandler) OnStream(ctx context.Context, packet turntf.Packet, fram
 		if receiver == nil {
 			receiver = &streamReceiver{peer: packet.Sender, targetSession: packet.TargetSession, state: turntf.NewStreamReceiverState(frame.ID, frame.Epoch, frame.Window)}
 			r.streamRecv[frame.ID] = receiver
+		} else {
+			receiver.setSession(packet.TargetSession)
 		}
 		restart := false
 		if !packet.TargetSession.IsZero() {
@@ -636,8 +717,7 @@ func (h runtimeHandler) OnStream(ctx context.Context, packet turntf.Packet, fram
 		port := r.streamPorts[packet.Sender]
 		r.streamMu.RUnlock()
 		if port != nil && port.id == frame.ID {
-			port.setOpenSession(packet.TargetSession)
-			port.markReady(nil)
+			port.acceptOpenAck(packet.TargetSession, frame.Epoch)
 		}
 	case turntf.StreamFrameData:
 		r.streamMu.RLock()
@@ -662,13 +742,13 @@ func (h runtimeHandler) OnStream(ctx context.Context, packet turntf.Packet, fram
 			}
 			r.writeMu.Unlock()
 		}
-		_, _ = r.sendStreamFrame(ctx, receiver.peer, receiver.targetSession, ack)
+		_, _ = r.sendStreamFrame(ctx, receiver.peer, receiver.session(), ack)
 	case turntf.StreamFrameAck:
 		r.streamMu.RLock()
 		port := r.streamPorts[packet.Sender]
 		r.streamMu.RUnlock()
 		if port != nil && port.id == frame.ID {
-			port.acknowledge(frame)
+			port.acknowledge(packet.TargetSession, frame)
 		}
 	case turntf.StreamFrameResume:
 		r.streamMu.RLock()
@@ -676,7 +756,8 @@ func (h runtimeHandler) OnStream(ctx context.Context, packet turntf.Packet, fram
 		r.streamMu.RUnlock()
 		if receiver != nil {
 			if ack, err := receiver.state.Resume(frame.Epoch, frame.Offset); err == nil {
-				_, _ = r.sendStreamFrame(ctx, receiver.peer, receiver.targetSession, ack)
+				receiver.setSession(packet.TargetSession)
+				_, _ = r.sendStreamFrame(ctx, receiver.peer, receiver.session(), ack)
 			}
 		}
 	case turntf.StreamFrameClose:

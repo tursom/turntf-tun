@@ -79,6 +79,7 @@ type Runtime struct {
 	streamResolve    func(context.Context, turntf.UserRef) (turntf.ResolvedUserSessions, error)
 	streamSend       func(context.Context, turntf.UserRef, turntf.SessionRef, turntf.StreamFrame, turntf.DeliveryMode) (turntf.RelayAccepted, error)
 	streamNewID      func() (turntf.StreamID, error)
+	streamTimeout    time.Duration
 	relayDial        func(context.Context, PeerConfig)
 	localUser        turntf.UserRef
 	connected        bool

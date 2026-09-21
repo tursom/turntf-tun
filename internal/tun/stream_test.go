@@ -17,7 +17,7 @@ func testStreamPort() *streamPort {
 	return &streamPort{
 		id: id, sender: turntf.NewStreamSenderState(id, 1, 1024),
 		queue: make(chan []byte, 4), ready: make(chan struct{}), lost: make(chan struct{}, 1),
-		epoch: 1, openErr: make(chan error, 1), ctx: ctx, cancel: cancel,
+		epoch: 1, attemptErr: make(chan error, 1), ctx: ctx, cancel: cancel,
 		done: make(chan struct{}), restart: make(chan struct{}),
 	}
 }
@@ -224,6 +224,141 @@ func failingStreamRuntime(peer, local turntf.UserRef, openCount *atomic.Int32) *
 	}
 }
 
+func TestRunStreamTriesRemainingSessionsAndIgnoresLateOpenAck(t *testing.T) {
+	peerRef := turntf.UserRef{NodeID: 2, UserID: 3}
+	peer := PeerConfig{Name: "peer", User: UserRefConfig{NodeID: peerRef.NodeID, UserID: peerRef.UserID}}
+	staleSession := turntf.SessionRef{ServingNodeID: 4, SessionID: "stale"}
+	currentSession := turntf.SessionRef{ServingNodeID: 5, SessionID: "current"}
+	secondOpen := make(chan sentStreamFrame, 1)
+	ready := make(chan struct{}, 1)
+	var mu sync.Mutex
+	var sent []sentStreamFrame
+	r := &Runtime{
+		cfg:           Config{Transport: TransportConfig{SendQueueSize: 4, DialRetryInterval: Duration{Duration: time.Second}}},
+		activeStreams: make(map[turntf.UserRef]*streamPort),
+		streamPorts:   make(map[turntf.UserRef]*streamPort),
+		streamRecv:    make(map[turntf.StreamID]*streamReceiver),
+		streamTimeout: 5 * time.Millisecond,
+		streamResolve: func(context.Context, turntf.UserRef) (turntf.ResolvedUserSessions, error) {
+			return turntf.ResolvedUserSessions{Sessions: []turntf.ResolvedSession{
+				{Session: staleSession, TransientCapable: true},
+				{Session: currentSession, TransientCapable: true},
+			}}, nil
+		},
+		streamNewID: func() (turntf.StreamID, error) { return turntf.StreamID{7}, nil },
+		streamSend: func(_ context.Context, _ turntf.UserRef, target turntf.SessionRef, frame turntf.StreamFrame, _ turntf.DeliveryMode) (turntf.RelayAccepted, error) {
+			if frame.Kind == turntf.StreamFrameOpen {
+				mu.Lock()
+				sent = append(sent, sentStreamFrame{session: target, frame: frame})
+				mu.Unlock()
+				if target == currentSession {
+					secondOpen <- sentStreamFrame{session: target, frame: frame}
+				}
+			}
+			return turntf.RelayAccepted{}, nil
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan streamRunResult, 1)
+	go func() {
+		result <- r.runStream(ctx, peer, func() { ready <- struct{}{} }, func() {})
+	}()
+
+	open := waitForStreamFrame(t, secondOpen, turntf.StreamFrameOpen)
+	handler := runtimeHandler{runtime: r}
+	handler.OnStream(ctx, turntf.Packet{Sender: peerRef, TargetSession: staleSession}, turntf.StreamFrame{Kind: turntf.StreamFrameOpenAck, ID: open.frame.ID, Epoch: open.frame.Epoch, Window: open.frame.Window})
+	select {
+	case <-ready:
+		t.Fatal("late stale-session OpenAck activated the current candidate")
+	default:
+	}
+	handler.OnStream(ctx, turntf.Packet{Sender: peerRef, TargetSession: currentSession}, turntf.StreamFrame{Kind: turntf.StreamFrameOpenAck, ID: open.frame.ID, Epoch: open.frame.Epoch, Window: open.frame.Window})
+	select {
+	case <-ready:
+	case <-time.After(time.Second):
+		t.Fatal("current-session OpenAck did not activate stream")
+	}
+	cancel()
+	select {
+	case got := <-result:
+		if got != streamRunStopped {
+			t.Fatalf("runStream result = %v, want stopped", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("runStream did not stop")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(sent) != 2 || sent[0].session != staleSession || sent[1].session != currentSession {
+		t.Fatalf("Open attempts = %+v, want stale then current", sent)
+	}
+}
+
+func TestRecoverStreamTriesRemainingSessionsAndIgnoresLateAck(t *testing.T) {
+	peerRef := turntf.UserRef{NodeID: 20, UserID: 30}
+	peer := PeerConfig{Name: "peer", User: UserRefConfig{NodeID: peerRef.NodeID, UserID: peerRef.UserID}}
+	staleSession := turntf.SessionRef{ServingNodeID: 40, SessionID: "stale"}
+	currentSession := turntf.SessionRef{ServingNodeID: 41, SessionID: "current"}
+	port := testStreamPort()
+	port.peer = peerRef
+	port.targetSession = staleSession
+	port.readyState = true
+	close(port.ready)
+	if _, err := port.sender.Data([]byte("pending")); err != nil {
+		t.Fatal(err)
+	}
+	secondResume := make(chan sentStreamFrame, 1)
+	var mu sync.Mutex
+	var sent []sentStreamFrame
+	r := &Runtime{
+		cfg:           Config{Transport: TransportConfig{DialRetryInterval: Duration{Duration: time.Second}}},
+		streamPorts:   map[turntf.UserRef]*streamPort{peerRef: port},
+		streamTimeout: 5 * time.Millisecond,
+		streamResolve: func(context.Context, turntf.UserRef) (turntf.ResolvedUserSessions, error) {
+			return turntf.ResolvedUserSessions{Sessions: []turntf.ResolvedSession{
+				{Session: staleSession, TransientCapable: true},
+				{Session: currentSession, TransientCapable: true},
+			}}, nil
+		},
+		streamSend: func(_ context.Context, _ turntf.UserRef, target turntf.SessionRef, frame turntf.StreamFrame, _ turntf.DeliveryMode) (turntf.RelayAccepted, error) {
+			mu.Lock()
+			sent = append(sent, sentStreamFrame{session: target, frame: frame})
+			mu.Unlock()
+			if frame.Kind == turntf.StreamFrameResume && target == currentSession {
+				secondResume <- sentStreamFrame{session: target, frame: frame}
+			}
+			return turntf.RelayAccepted{}, nil
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	recovered := make(chan bool, 1)
+	go func() { recovered <- r.recoverStream(ctx, peer, port) }()
+	resume := waitForStreamFrame(t, secondResume, turntf.StreamFrameResume)
+	handler := runtimeHandler{runtime: r}
+	ack := turntf.StreamFrame{Kind: turntf.StreamFrameAck, ID: port.id, Epoch: resume.frame.Epoch, Offset: resume.frame.Offset, Window: turntf.DefaultStreamWindow}
+	handler.OnStream(ctx, turntf.Packet{Sender: peerRef, TargetSession: staleSession}, ack)
+	select {
+	case <-recovered:
+		t.Fatal("late stale-session ACK completed current Resume")
+	default:
+	}
+	handler.OnStream(ctx, turntf.Packet{Sender: peerRef, TargetSession: currentSession}, ack)
+	select {
+	case ok := <-recovered:
+		if !ok {
+			t.Fatal("recovery failed")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("current-session ACK did not complete recovery")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(sent) != 3 || sent[0].frame.Kind != turntf.StreamFrameResume || sent[0].session != staleSession || sent[1].frame.Kind != turntf.StreamFrameResume || sent[1].session != currentSession || sent[2].frame.Kind != turntf.StreamFrameData || sent[2].session != currentSession {
+		t.Fatalf("recovery attempts = %+v, want stale Resume, current Resume, current Data", sent)
+	}
+}
+
 func waitForCondition(t *testing.T, condition func() bool, message string) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
@@ -257,7 +392,8 @@ func TestStreamPortResumeKeepsIDAndPendingSuffix(t *testing.T) {
 	if frame.ID != p.id {
 		t.Fatalf("sender ID = %v, want %v", frame.ID, p.id)
 	}
-	lastAck, ready := p.beginResume(turntf.SessionRef{ServingNodeID: 2, SessionID: "session-3"}, 2)
+	session := turntf.SessionRef{ServingNodeID: 2, SessionID: "session-3"}
+	lastAck, ready, _ := p.beginResume(session, 2)
 	frames, err := p.sender.Resume(2, lastAck)
 	if err != nil {
 		t.Fatal(err)
@@ -270,7 +406,7 @@ func TestStreamPortResumeKeepsIDAndPendingSuffix(t *testing.T) {
 		t.Fatal("resume became ready before ACK")
 	default:
 	}
-	p.acknowledge(turntf.StreamFrame{Kind: turntf.StreamFrameAck, ID: p.id, Epoch: 2, Offset: frame.Offset + uint64(len(frame.Payload))})
+	p.acknowledge(session, turntf.StreamFrame{Kind: turntf.StreamFrameAck, ID: p.id, Epoch: 2, Offset: frame.Offset + uint64(len(frame.Payload))})
 	select {
 	case <-ready:
 	default:
@@ -463,7 +599,7 @@ func TestRecoverStreamResolvesCurrentSessionAfterAsyncError(t *testing.T) {
 			sent = append(sent, sentStreamFrame{session: target, frame: frame})
 			mu.Unlock()
 			if frame.Kind == turntf.StreamFrameResume {
-				go port.acknowledge(turntf.StreamFrame{Kind: turntf.StreamFrameAck, ID: port.id, Epoch: frame.Epoch, Offset: pending.Offset + uint64(len(pending.Payload)), Window: turntf.DefaultStreamWindow})
+				go port.acknowledge(target, turntf.StreamFrame{Kind: turntf.StreamFrameAck, ID: port.id, Epoch: frame.Epoch, Offset: pending.Offset + uint64(len(pending.Payload)), Window: turntf.DefaultStreamWindow})
 			}
 			return turntf.RelayAccepted{}, nil
 		},
@@ -489,6 +625,69 @@ func TestRecoverStreamResolvesCurrentSessionAfterAsyncError(t *testing.T) {
 	defer mu.Unlock()
 	if len(sent) < 2 || sent[0].frame.Kind != turntf.StreamFrameResume || sent[0].session != newSession || sent[1].frame.Kind != turntf.StreamFrameData || sent[1].session != newSession {
 		t.Fatalf("recovery frames = %+v", sent)
+	}
+}
+
+func TestRunStreamTriesNextSessionAfterOpenSendError(t *testing.T) {
+	peerRef := turntf.UserRef{NodeID: 2, UserID: 3}
+	peer := PeerConfig{Name: "peer", User: UserRefConfig{NodeID: peerRef.NodeID, UserID: peerRef.UserID}}
+	failedSession := turntf.SessionRef{ServingNodeID: 4, SessionID: "failed"}
+	currentSession := turntf.SessionRef{ServingNodeID: 5, SessionID: "current"}
+	r := &Runtime{
+		cfg:           Config{Transport: TransportConfig{SendQueueSize: 4}},
+		activeStreams: make(map[turntf.UserRef]*streamPort),
+		streamPorts:   make(map[turntf.UserRef]*streamPort),
+		streamRecv:    make(map[turntf.StreamID]*streamReceiver),
+		streamResolve: func(context.Context, turntf.UserRef) (turntf.ResolvedUserSessions, error) {
+			return turntf.ResolvedUserSessions{Sessions: []turntf.ResolvedSession{
+				{Session: failedSession, TransientCapable: true},
+				{Session: currentSession, TransientCapable: true},
+			}}, nil
+		},
+		streamNewID: func() (turntf.StreamID, error) { return turntf.StreamID{8}, nil },
+	}
+	r.streamSend = func(ctx context.Context, _ turntf.UserRef, target turntf.SessionRef, frame turntf.StreamFrame, _ turntf.DeliveryMode) (turntf.RelayAccepted, error) {
+		if target == failedSession {
+			return turntf.RelayAccepted{}, errors.New("stale session")
+		}
+		runtimeHandler{runtime: r}.OnStream(ctx, turntf.Packet{Sender: peerRef, TargetSession: currentSession}, turntf.StreamFrame{Kind: turntf.StreamFrameOpenAck, ID: frame.ID, Epoch: frame.Epoch, Window: frame.Window})
+		return turntf.RelayAccepted{}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan streamRunResult, 1)
+	go func() {
+		result <- r.runStream(ctx, peer, cancel, func() {})
+	}()
+	select {
+	case got := <-result:
+		if got != streamRunStopped {
+			t.Fatalf("runStream result = %v, want stopped", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("runStream did not activate the second candidate")
+	}
+}
+
+func TestResumeUpdatesReceiverTargetSession(t *testing.T) {
+	peer := turntf.UserRef{NodeID: 2, UserID: 3}
+	oldSession := turntf.SessionRef{ServingNodeID: 4, SessionID: "old"}
+	newSession := turntf.SessionRef{ServingNodeID: 5, SessionID: "new"}
+	id := turntf.StreamID{9}
+	receiver := &streamReceiver{peer: peer, targetSession: oldSession, state: turntf.NewStreamReceiverState(id, 1, turntf.DefaultStreamWindow)}
+	var sent sentStreamFrame
+	r := &Runtime{
+		streamRecv: map[turntf.StreamID]*streamReceiver{id: receiver},
+		streamSend: func(_ context.Context, _ turntf.UserRef, target turntf.SessionRef, frame turntf.StreamFrame, _ turntf.DeliveryMode) (turntf.RelayAccepted, error) {
+			sent = sentStreamFrame{session: target, frame: frame}
+			return turntf.RelayAccepted{}, nil
+		},
+	}
+	runtimeHandler{runtime: r}.OnStream(context.Background(), turntf.Packet{Sender: peer, TargetSession: newSession}, turntf.StreamFrame{Kind: turntf.StreamFrameResume, ID: id, Epoch: 2})
+	if sent.frame.Kind != turntf.StreamFrameAck || sent.session != newSession {
+		t.Fatalf("Resume response = %+v, want Ack to new session", sent)
+	}
+	if got := receiver.session(); got != newSession {
+		t.Fatalf("receiver session = %+v, want %+v", got, newSession)
 	}
 }
 
