@@ -184,6 +184,38 @@ func TestReadRelayLoopWritesDecodedBatchToDevice(t *testing.T) {
 	waitForDone(t, done, "relay read loop did not stop")
 }
 
+func TestClosePortAllowsSynchronousOnCloseReentry(t *testing.T) {
+	peerRef := turntf.UserRef{NodeID: 2, UserID: 1}
+	peer := PeerConfig{Name: "peer", User: UserRefConfig{NodeID: peerRef.NodeID, UserID: peerRef.UserID}}
+	r := &Runtime{
+		cfg:        Config{Transport: TransportConfig{SendQueueSize: 1, MaxPacketBytes: 65535}},
+		device:     &recordingPacketDevice{writes: make(chan []byte, 1)},
+		ports:      make(map[turntf.UserRef]*peerPort),
+		relayPorts: make(map[turntf.UserRef]map[string]*peerPort),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn := newFakeRelayConn("relay-sync-close")
+	conn.synchronousCloseCallbacks = true
+	port := r.registerPort(ctx, peer, conn)
+
+	closed := make(chan struct{})
+	go func() {
+		port.close()
+		close(closed)
+	}()
+	waitForDone(t, closed, "port close deadlocked in synchronous OnClose callback")
+	waitForDone(t, port.done, "port done was not closed")
+
+	r.mu.RLock()
+	selected := r.ports[peerRef]
+	remaining := len(r.relayPorts[peerRef])
+	r.mu.RUnlock()
+	if selected != nil || remaining != 0 {
+		t.Fatalf("closed port remained registered: selected=%p remaining=%d", selected, remaining)
+	}
+}
+
 func TestRegisterPortKeepsWarmRelayWhileStreamIsActive(t *testing.T) {
 	peerRef := turntf.UserRef{NodeID: 2, UserID: 1}
 	peer := PeerConfig{Name: "peer", User: UserRefConfig{NodeID: peerRef.NodeID, UserID: peerRef.UserID}}
@@ -444,13 +476,14 @@ func (d *recordingPacketDevice) WritePacket(packet []byte) error {
 func (d *recordingPacketDevice) Close() error { return nil }
 
 type fakeRelayConn struct {
-	id        string
-	receive   chan []byte
-	sent      chan []byte
-	closed    chan struct{}
-	once      sync.Once
-	mu        sync.Mutex
-	callbacks []func(error)
+	id                        string
+	receive                   chan []byte
+	sent                      chan []byte
+	closed                    chan struct{}
+	once                      sync.Once
+	mu                        sync.Mutex
+	callbacks                 []func(error)
+	synchronousCloseCallbacks bool
 }
 
 func newFakeRelayConn(id string) *fakeRelayConn {
@@ -485,7 +518,11 @@ func (c *fakeRelayConn) Abort(err error) {
 		callbacks := append([]func(error){}, c.callbacks...)
 		c.mu.Unlock()
 		for _, callback := range callbacks {
-			go callback(err)
+			if c.synchronousCloseCallbacks {
+				callback(err)
+			} else {
+				go callback(err)
+			}
 		}
 	})
 }

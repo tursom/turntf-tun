@@ -30,15 +30,20 @@ type peerPort struct {
 	conn         relayConn
 	queue        chan []byte
 	done         chan struct{}
-	once         sync.Once
+	doneOnce     sync.Once
+	abortOnce    sync.Once
 	queuedOnce   sync.Once
 	sentOnce     sync.Once
 	receivedOnce sync.Once
 }
 
+func (p *peerPort) closeDone() {
+	p.doneOnce.Do(func() { close(p.done) })
+}
+
 func (p *peerPort) close() {
-	p.once.Do(func() {
-		close(p.done)
+	p.closeDone()
+	p.abortOnce.Do(func() {
 		if p.conn != nil {
 			p.conn.Abort(errors.New("replaced or closed"))
 		}
@@ -328,7 +333,7 @@ func (r *Runtime) unregisterPort(user turntf.UserRef, p *peerPort) {
 		}
 	}
 	r.mu.Unlock()
-	p.once.Do(func() { close(p.done) })
+	p.closeDone()
 }
 func (r *Runtime) writeRelayLoop(p *peerPort) {
 	var pending []byte
