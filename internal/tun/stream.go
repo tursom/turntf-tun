@@ -289,13 +289,13 @@ func (r *Runtime) streamLoop(ctx context.Context, peer PeerConfig) {
 		fallbackCancel = nil
 		fallbackDone = nil
 	}
+	startFallback()
 	defer stopFallback()
 	for ctx.Err() == nil {
-		switch r.runStream(ctx, peer, stopFallback, startFallback) {
+		switch r.runStream(ctx, peer, func() {}, func() {}) {
 		case streamRunRestart:
 			continue
 		case streamRunFallback:
-			startFallback()
 			if !sleepContext(ctx, r.cfg.Transport.DialRetryInterval.Duration) {
 				return
 			}
@@ -414,20 +414,7 @@ func (r *Runtime) activateStream(peer turntf.UserRef, stream *streamPort) {
 		r.activeStreams = make(map[turntf.UserRef]*streamPort)
 	}
 	r.activeStreams[peer] = stream
-	connections := r.relayPorts[peer]
-	var relays []*peerPort
-	for _, relay := range connections {
-		relays = append(relays, relay)
-	}
-	if len(relays) == 0 && r.ports[peer] != nil {
-		relays = append(relays, r.ports[peer])
-	}
-	delete(r.relayPorts, peer)
-	delete(r.ports, peer)
 	r.mu.Unlock()
-	for _, relay := range relays {
-		relay.close()
-	}
 }
 
 func (r *Runtime) deactivateStream(peer turntf.UserRef, stream *streamPort) {

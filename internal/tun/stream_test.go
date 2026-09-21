@@ -122,12 +122,12 @@ func TestStreamLoopRetriesAfterFallbackAndActivatesStream(t *testing.T) {
 		r.streamMu.RLock()
 		registered := r.streamPorts[peerRef]
 		r.streamMu.RUnlock()
-		return openCount.Load() >= 2 && active != nil && active == registered && relay == nil
-	}, "stream did not replace fallback relay")
+		return openCount.Load() >= 2 && active != nil && active == registered && relay == fallbackPort
+	}, "stream did not activate while retaining warm Relay fallback")
 	select {
 	case <-fallbackPort.done:
+		t.Fatal("warm Relay fallback closed after one stream direction activated")
 	default:
-		t.Fatal("fallback relay was not closed after stream activation")
 	}
 	if got := dialCount.Load(); got != 1 {
 		t.Fatalf("fallback dial count = %d, want 1", got)
@@ -543,6 +543,9 @@ func TestStreamOpenSessionChangeRebuildsOutboundOnce(t *testing.T) {
 			defer mu.Unlock()
 			idCount++
 			return turntf.StreamID{idCount}, nil
+		},
+		relayDial: func(ctx context.Context, _ PeerConfig) {
+			<-ctx.Done()
 		},
 		streamSend: func(_ context.Context, _ turntf.UserRef, target turntf.SessionRef, frame turntf.StreamFrame, _ turntf.DeliveryMode) (turntf.RelayAccepted, error) {
 			event := sentStreamFrame{session: target, frame: frame}
