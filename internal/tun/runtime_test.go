@@ -184,6 +184,50 @@ func TestReadRelayLoopWritesDecodedBatchToDevice(t *testing.T) {
 	waitForDone(t, done, "relay read loop did not stop")
 }
 
+func TestRegisterPortKeepsWarmRelayWhileStreamIsActive(t *testing.T) {
+	peerRef := turntf.UserRef{NodeID: 2, UserID: 1}
+	peer := PeerConfig{Name: "peer", User: UserRefConfig{NodeID: peerRef.NodeID, UserID: peerRef.UserID}}
+	device := &recordingPacketDevice{writes: make(chan []byte, 1)}
+	r := &Runtime{
+		cfg:           Config{Transport: TransportConfig{SendQueueSize: 8, MaxPacketBytes: 65535}},
+		device:        device,
+		ports:         make(map[turntf.UserRef]*peerPort),
+		relayPorts:    make(map[turntf.UserRef]map[string]*peerPort),
+		activeStreams: map[turntf.UserRef]*streamPort{peerRef: testStreamPort()},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn := newFakeRelayConn("warm-relay")
+	port := r.registerPort(ctx, peer, conn)
+	r.mu.RLock()
+	selected := r.ports[peerRef]
+	live := len(r.relayPorts[peerRef])
+	r.mu.RUnlock()
+	if selected != port || live != 1 {
+		t.Fatalf("warm fallback selected=%p live=%d, want registered port", selected, live)
+	}
+	select {
+	case <-conn.closed:
+		t.Fatal("warm Relay was closed while stream was active")
+	default:
+	}
+	packet := ipv4Packet(10, 0, 0, 2)
+	batch, ok := appendTunBatch(nil, packet)
+	if !ok {
+		t.Fatal("append warm Relay packet")
+	}
+	conn.receive <- batch
+	select {
+	case got := <-device.writes:
+		if string(got) != string(packet) {
+			t.Fatalf("warm Relay receive = %v, want %v", got, packet)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("warm Relay did not remain receive-capable")
+	}
+	port.close()
+}
+
 func TestRegisterPortKeepsFiveSessionReceivePathsAndPromotesOutbound(t *testing.T) {
 	peerRef := turntf.UserRef{NodeID: 2, UserID: 1}
 	peer := PeerConfig{Name: "peer", User: UserRefConfig{NodeID: peerRef.NodeID, UserID: peerRef.UserID}}

@@ -279,11 +279,6 @@ func (r *Runtime) registerPort(ctx context.Context, peer PeerConfig, conn relayC
 	p := &peerPort{runtime: r, peer: &peerConfig{config: &peer}, conn: conn, queue: make(chan []byte, r.cfg.Transport.SendQueueSize), done: make(chan struct{})}
 	user := peer.User.ToTurntf()
 	r.mu.Lock()
-	if r.activeStreams[user] != nil {
-		r.mu.Unlock()
-		p.close()
-		return p
-	}
 	if r.relayPorts == nil {
 		r.relayPorts = make(map[turntf.UserRef]map[string]*peerPort)
 	}
