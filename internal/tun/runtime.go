@@ -237,8 +237,7 @@ func (r *Runtime) readTUNLoop(ctx context.Context) {
 		stream := r.activeStreams[user]
 		port := r.ports[user]
 		r.mu.RUnlock()
-		if stream != nil {
-			stream.enqueue(packet)
+		if stream != nil && stream.enqueueReady(packet) {
 			continue
 		}
 		if port != nil {

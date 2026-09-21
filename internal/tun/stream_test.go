@@ -417,6 +417,34 @@ func TestStreamPortResumeKeepsIDAndPendingSuffix(t *testing.T) {
 	}
 }
 
+func TestStreamPortRejectsInvalidResumeAck(t *testing.T) {
+	p := testStreamPort()
+	session := turntf.SessionRef{ServingNodeID: 4, SessionID: "session"}
+	frame, err := p.sender.Data([]byte("pending"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, ready, _ := p.beginResume(session, 2)
+	if _, err := p.sender.Resume(2, 0); err != nil {
+		t.Fatal(err)
+	}
+	p.acknowledge(session, turntf.StreamFrame{
+		Kind:   turntf.StreamFrameAck,
+		ID:     p.id,
+		Epoch:  2,
+		Offset: frame.Offset + uint64(len(frame.Payload)) + 1,
+		Window: turntf.DefaultStreamWindow,
+	})
+	select {
+	case <-ready:
+		t.Fatal("invalid Resume ACK activated path")
+	default:
+	}
+	if p.readyState || p.lastAck != 0 {
+		t.Fatalf("invalid Resume ACK changed state: ready=%v last_ack=%d", p.readyState, p.lastAck)
+	}
+}
+
 func TestRuntimeDisconnectInvalidatesReadyStreamsOnce(t *testing.T) {
 	firstPeer := turntf.UserRef{NodeID: 2, UserID: 3}
 	secondPeer := turntf.UserRef{NodeID: 4, UserID: 5}
@@ -426,7 +454,10 @@ func TestRuntimeDisconnectInvalidatesReadyStreamsOnce(t *testing.T) {
 		port.readyState = true
 		close(port.ready)
 	}
-	r := &Runtime{streamPorts: map[turntf.UserRef]*streamPort{firstPeer: first, secondPeer: second}}
+	r := &Runtime{
+		streamPorts:   map[turntf.UserRef]*streamPort{firstPeer: first, secondPeer: second},
+		activeStreams: map[turntf.UserRef]*streamPort{firstPeer: first, secondPeer: second},
+	}
 	h := runtimeHandler{runtime: r}
 	h.OnDisconnect(context.Background(), errors.New("websocket disconnected"))
 	for peer, port := range map[turntf.UserRef]*streamPort{firstPeer: first, secondPeer: second} {
@@ -437,6 +468,9 @@ func TestRuntimeDisconnectInvalidatesReadyStreamsOnce(t *testing.T) {
 		}
 		if port.readyState {
 			t.Fatalf("peer %v remained ready", peer)
+		}
+		if r.activeStreams[peer] != nil {
+			t.Fatalf("peer %v remained active after disconnect", peer)
 		}
 	}
 	h.OnDisconnect(context.Background(), errors.New("duplicate websocket disconnect"))
@@ -469,8 +503,9 @@ func TestTrackedStreamErrorInvalidatesOnlyMatchingPeerSession(t *testing.T) {
 	failedRelayPort := &peerPort{conn: failedRelay, done: make(chan struct{})}
 	healthyRelayPort := &peerPort{conn: healthyRelay, done: make(chan struct{})}
 	r := &Runtime{
-		streamPorts: map[turntf.UserRef]*streamPort{failedPeer: failed, healthyPeer: healthy},
-		ports:       map[turntf.UserRef]*peerPort{failedPeer: failedRelayPort, healthyPeer: healthyRelayPort},
+		streamPorts:   map[turntf.UserRef]*streamPort{failedPeer: failed, healthyPeer: healthy},
+		activeStreams: map[turntf.UserRef]*streamPort{failedPeer: failed, healthyPeer: healthy},
+		ports:         map[turntf.UserRef]*peerPort{failedPeer: failedRelayPort, healthyPeer: healthyRelayPort},
 		relayPorts: map[turntf.UserRef]map[string]*peerPort{
 			failedPeer:  {failedRelay.RelayID(): failedRelayPort},
 			healthyPeer: {healthyRelay.RelayID(): healthyRelayPort},
@@ -483,7 +518,7 @@ func TestTrackedStreamErrorInvalidatesOnlyMatchingPeerSession(t *testing.T) {
 	h := runtimeHandler{runtime: r}
 	h.OnStreamSendResult(context.Background(), turntf.StreamSendResult{
 		RequestID: 1,
-		Metadata:  turntf.StreamSendMetadata{Target: failedPeer, TargetSession: failedSession, StreamID: failed.id, Kind: turntf.StreamFrameData},
+		Metadata:  turntf.StreamSendMetadata{Target: failedPeer, TargetSession: failedSession, StreamID: failed.id, Kind: turntf.StreamFrameData, Epoch: failed.epoch},
 		Err:       errors.New("stream target session unavailable"),
 	})
 	select {
@@ -504,13 +539,19 @@ func TestTrackedStreamErrorInvalidatesOnlyMatchingPeerSession(t *testing.T) {
 	}
 	select {
 	case <-failedRelay.closed:
+		t.Fatal("stream failure closed the failed peer warm Relay")
 	default:
-		t.Fatal("failed peer stale Relay was not closed")
 	}
 	select {
 	case <-healthyRelay.closed:
 		t.Fatal("healthy peer Relay was closed")
 	default:
+	}
+	if r.activeStreams[failedPeer] != nil {
+		t.Fatal("failed stream remained active")
+	}
+	if r.activeStreams[healthyPeer] != healthy {
+		t.Fatal("healthy stream was removed from active paths")
 	}
 	r.streamMu.RLock()
 	_, failedPreferred := r.preferredStreams[failedPeer]
@@ -518,6 +559,44 @@ func TestTrackedStreamErrorInvalidatesOnlyMatchingPeerSession(t *testing.T) {
 	r.streamMu.RUnlock()
 	if failedPreferred || gotHealthy != healthySession {
 		t.Fatalf("preferred sessions after failure: failed_present=%v healthy=%+v", failedPreferred, gotHealthy)
+	}
+}
+
+func TestTrackedStreamErrorForOldStreamIDDoesNotInvalidateCurrentPath(t *testing.T) {
+	peer := turntf.UserRef{NodeID: 2, UserID: 3}
+	session := turntf.SessionRef{ServingNodeID: 6, SessionID: "current"}
+	port := testStreamPort()
+	port.peer = peer
+	port.id = turntf.StreamID{2}
+	port.targetSession = session
+	port.readyState = true
+	close(port.ready)
+	relay := newFakeRelayConn("warm-relay")
+	relayPort := &peerPort{conn: relay, done: make(chan struct{})}
+	r := &Runtime{
+		streamPorts:      map[turntf.UserRef]*streamPort{peer: port},
+		activeStreams:    map[turntf.UserRef]*streamPort{peer: port},
+		ports:            map[turntf.UserRef]*peerPort{peer: relayPort},
+		relayPorts:       map[turntf.UserRef]map[string]*peerPort{peer: {relay.RelayID(): relayPort}},
+		preferredStreams: map[turntf.UserRef]turntf.SessionRef{peer: session},
+	}
+	runtimeHandler{runtime: r}.OnStreamSendResult(context.Background(), turntf.StreamSendResult{
+		RequestID: 3,
+		Metadata:  turntf.StreamSendMetadata{Target: peer, TargetSession: session, StreamID: turntf.StreamID{1}, Kind: turntf.StreamFrameData, Epoch: port.epoch},
+		Err:       errors.New("late error from old stream"),
+	})
+	select {
+	case <-port.lost:
+		t.Fatal("late old-stream error invalidated current path")
+	default:
+	}
+	select {
+	case <-relay.closed:
+		t.Fatal("late old-stream error closed warm Relay")
+	default:
+	}
+	if !port.readyState || r.activeStreams[peer] != port || r.preferredStreams[peer] != session {
+		t.Fatal("late old-stream error changed current path state")
 	}
 }
 
@@ -533,7 +612,7 @@ func TestTrackedStreamErrorForOldSessionDoesNotInvalidateNewPath(t *testing.T) {
 	r := &Runtime{streamPorts: map[turntf.UserRef]*streamPort{peer: port}, preferredStreams: map[turntf.UserRef]turntf.SessionRef{peer: newSession}}
 	runtimeHandler{runtime: r}.OnStreamSendResult(context.Background(), turntf.StreamSendResult{
 		RequestID: 2,
-		Metadata:  turntf.StreamSendMetadata{Target: peer, TargetSession: oldSession, StreamID: port.id, Kind: turntf.StreamFrameData},
+		Metadata:  turntf.StreamSendMetadata{Target: peer, TargetSession: oldSession, StreamID: port.id, Kind: turntf.StreamFrameData, Epoch: port.epoch},
 		Err:       errors.New("late error from old session"),
 	})
 	select {
@@ -543,6 +622,35 @@ func TestTrackedStreamErrorForOldSessionDoesNotInvalidateNewPath(t *testing.T) {
 	}
 	if !port.readyState {
 		t.Fatal("current path was marked not ready")
+	}
+}
+
+func TestTrackedStreamErrorForOldEpochDoesNotInvalidateResumedPath(t *testing.T) {
+	peer := turntf.UserRef{NodeID: 2, UserID: 3}
+	session := turntf.SessionRef{ServingNodeID: 6, SessionID: "session"}
+	port := testStreamPort()
+	port.peer = peer
+	port.targetSession = session
+	port.epoch = 2
+	port.readyState = true
+	close(port.ready)
+	r := &Runtime{
+		streamPorts:      map[turntf.UserRef]*streamPort{peer: port},
+		activeStreams:    map[turntf.UserRef]*streamPort{peer: port},
+		preferredStreams: map[turntf.UserRef]turntf.SessionRef{peer: session},
+	}
+	runtimeHandler{runtime: r}.OnStreamSendResult(context.Background(), turntf.StreamSendResult{
+		RequestID: 4,
+		Metadata:  turntf.StreamSendMetadata{Target: peer, TargetSession: session, StreamID: port.id, Kind: turntf.StreamFrameData, Epoch: 1},
+		Err:       errors.New("late error from old epoch"),
+	})
+	select {
+	case <-port.lost:
+		t.Fatal("late old-epoch error invalidated resumed path")
+	default:
+	}
+	if !port.readyState || r.activeStreams[peer] != port || r.preferredStreams[peer] != session {
+		t.Fatal("late old-epoch error changed resumed path state")
 	}
 }
 
@@ -606,7 +714,7 @@ func TestRecoverStreamResolvesCurrentSessionAfterAsyncError(t *testing.T) {
 	}
 	runtimeHandler{runtime: r}.OnStreamSendResult(context.Background(), turntf.StreamSendResult{
 		RequestID: 3,
-		Metadata:  turntf.StreamSendMetadata{Target: peerRef, TargetSession: oldSession, StreamID: port.id, Kind: turntf.StreamFrameData},
+		Metadata:  turntf.StreamSendMetadata{Target: peerRef, TargetSession: oldSession, StreamID: port.id, Kind: turntf.StreamFrameData, Epoch: port.epoch},
 		Err:       errors.New("stream target session unavailable"),
 	})
 	select {
@@ -674,9 +782,17 @@ func TestResumeUpdatesReceiverTargetSession(t *testing.T) {
 	newSession := turntf.SessionRef{ServingNodeID: 5, SessionID: "new"}
 	id := turntf.StreamID{9}
 	receiver := &streamReceiver{peer: peer, targetSession: oldSession, state: turntf.NewStreamReceiverState(id, 1, turntf.DefaultStreamWindow)}
+	outbound := testStreamPort()
+	outbound.peer = peer
+	outbound.targetSession = oldSession
+	outbound.readyState = true
+	close(outbound.ready)
 	var sent sentStreamFrame
 	r := &Runtime{
-		streamRecv: map[turntf.StreamID]*streamReceiver{id: receiver},
+		streamPorts:      map[turntf.UserRef]*streamPort{peer: outbound},
+		activeStreams:    map[turntf.UserRef]*streamPort{peer: outbound},
+		streamRecv:       map[turntf.StreamID]*streamReceiver{id: receiver},
+		preferredStreams: map[turntf.UserRef]turntf.SessionRef{peer: oldSession},
 		streamSend: func(_ context.Context, _ turntf.UserRef, target turntf.SessionRef, frame turntf.StreamFrame, _ turntf.DeliveryMode) (turntf.RelayAccepted, error) {
 			sent = sentStreamFrame{session: target, frame: frame}
 			return turntf.RelayAccepted{}, nil
@@ -688,6 +804,27 @@ func TestResumeUpdatesReceiverTargetSession(t *testing.T) {
 	}
 	if got := receiver.session(); got != newSession {
 		t.Fatalf("receiver session = %+v, want %+v", got, newSession)
+	}
+	if got := r.preferredStreams[peer]; got != newSession {
+		t.Fatalf("preferred session = %+v, want %+v", got, newSession)
+	}
+	select {
+	case <-outbound.lost:
+	default:
+		t.Fatal("Resume from a new session did not invalidate outbound path")
+	}
+	if outbound.readyState || r.activeStreams[peer] != nil {
+		t.Fatal("outbound path remained active after peer session changed")
+	}
+	select {
+	case <-outbound.restart:
+		t.Fatal("peer session change replaced the logical stream instead of resuming it")
+	default:
+	}
+	select {
+	case <-outbound.done:
+		t.Fatal("peer session change closed the logical stream")
+	default:
 	}
 }
 

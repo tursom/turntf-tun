@@ -104,6 +104,8 @@ func TestReadTUNUsesActiveStreamPerPeerAndRelayForOthers(t *testing.T) {
 	}
 	streamQueue := make(chan []byte, 1)
 	relayQueue := make(chan []byte, 1)
+	activeStream := &streamPort{queue: streamQueue, ready: make(chan struct{}), readyState: true}
+	close(activeStream.ready)
 	r := &Runtime{
 		cfg: Config{Transport: TransportConfig{MaxPacketBytes: 65535}},
 		device: &queuedPacketDevice{packets: [][]byte{
@@ -112,7 +114,7 @@ func TestReadTUNUsesActiveStreamPerPeerAndRelayForOthers(t *testing.T) {
 		}},
 		routes:        routes,
 		ports:         map[turntf.UserRef]*peerPort{relayRef: {queue: relayQueue}},
-		activeStreams: map[turntf.UserRef]*streamPort{streamRef: {queue: streamQueue}},
+		activeStreams: map[turntf.UserRef]*streamPort{streamRef: activeStream},
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -136,6 +138,45 @@ func TestReadTUNUsesActiveStreamPerPeerAndRelayForOthers(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("relay peer packet was not queued to Relay")
+	}
+	cancel()
+	waitForDone(t, done, "TUN read loop did not stop")
+}
+
+func TestReadTUNFallsBackToRelayWhileStreamIsNotReady(t *testing.T) {
+	peerRef := turntf.UserRef{NodeID: 2, UserID: 1}
+	peer := PeerConfig{Name: "peer", User: UserRefConfig{NodeID: peerRef.NodeID, UserID: peerRef.UserID}, Routes: []string{"10.0.0.2/32"}}
+	routes, err := newRouteTable([]PeerConfig{peer})
+	if err != nil {
+		t.Fatal(err)
+	}
+	streamQueue := make(chan []byte, 1)
+	relayQueue := make(chan []byte, 1)
+	r := &Runtime{
+		cfg:           Config{Transport: TransportConfig{MaxPacketBytes: 65535}},
+		device:        &queuedPacketDevice{packets: [][]byte{ipv4Packet(10, 0, 0, 2)}},
+		routes:        routes,
+		ports:         map[turntf.UserRef]*peerPort{peerRef: {queue: relayQueue}},
+		activeStreams: map[turntf.UserRef]*streamPort{peerRef: {queue: streamQueue, ready: make(chan struct{})}},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		r.readTUNLoop(ctx)
+		close(done)
+	}()
+	select {
+	case packet := <-relayQueue:
+		if got := packetDestination(packet).String(); got != "10.0.0.2" {
+			t.Fatalf("Relay packet destination = %s", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("packet did not fall back to Relay")
+	}
+	select {
+	case <-streamQueue:
+		t.Fatal("packet was queued to a not-ready stream")
+	default:
 	}
 	cancel()
 	waitForDone(t, done, "TUN read loop did not stop")

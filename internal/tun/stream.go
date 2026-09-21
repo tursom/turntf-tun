@@ -120,6 +120,15 @@ func (p *streamPort) enqueue(packet []byte) bool {
 		return false
 	}
 }
+
+func (p *streamPort) enqueueReady(packet []byte) bool {
+	p.pathMu.Lock()
+	defer p.pathMu.Unlock()
+	if !p.readyState {
+		return false
+	}
+	return p.enqueue(packet)
+}
 func (p *streamPort) beginOpen(session turntf.SessionRef) (<-chan struct{}, <-chan error) {
 	p.pathMu.Lock()
 	defer p.pathMu.Unlock()
@@ -140,9 +149,9 @@ func (p *streamPort) acceptOpenAck(session turntf.SessionRef, epoch uint64) bool
 	close(p.ready)
 	return true
 }
-func (p *streamPort) failPath(session turntf.SessionRef, err error) bool {
+func (p *streamPort) failPath(session turntf.SessionRef, epoch uint64, err error) bool {
 	p.pathMu.Lock()
-	if p.targetSession != session {
+	if p.targetSession != session || p.epoch != epoch {
 		p.pathMu.Unlock()
 		return false
 	}
@@ -206,7 +215,9 @@ func (p *streamPort) acknowledge(session turntf.SessionRef, frame turntf.StreamF
 	if session != p.targetSession || frame.Epoch != p.epoch {
 		return
 	}
-	_ = p.sender.Acknowledge(frame.Epoch, frame.Offset, frame.Window)
+	if err := p.sender.Acknowledge(frame.Epoch, frame.Offset, frame.Window); err != nil {
+		return
+	}
 	if frame.Offset > p.lastAck {
 		p.lastAck = frame.Offset
 	}
@@ -490,6 +501,19 @@ func (r *Runtime) deactivateStream(peer turntf.UserRef, stream *streamPort) {
 	r.mu.Unlock()
 }
 
+func (r *Runtime) deactivateStreamIfNotReady(peer turntf.UserRef, stream *streamPort) {
+	r.mu.Lock()
+	if r.activeStreams[peer] == stream {
+		stream.pathMu.Lock()
+		ready := stream.readyState
+		stream.pathMu.Unlock()
+		if !ready {
+			delete(r.activeStreams, peer)
+		}
+	}
+	r.mu.Unlock()
+}
+
 func (r *Runtime) recoverStream(ctx context.Context, peer PeerConfig, p *streamPort) bool {
 	for ctx.Err() == nil {
 		sessions, err := r.resolveStreamSessions(ctx, p.peer)
@@ -600,31 +624,20 @@ func (r *streamReceiver) setSession(session turntf.SessionRef) {
 	r.pathMu.Unlock()
 }
 
-func (r *Runtime) closeRelayPeer(peer turntf.UserRef) {
-	r.mu.RLock()
-	connections := r.relayPorts[peer]
-	ports := make([]*peerPort, 0, len(connections))
-	for _, port := range connections {
-		ports = append(ports, port)
-	}
-	if len(ports) == 0 && r.ports[peer] != nil {
-		ports = append(ports, r.ports[peer])
-	}
-	r.mu.RUnlock()
-	for _, port := range ports {
-		port.close()
-	}
-}
-
 func (r *Runtime) markAllStreamPathsLost(reason error) {
+	type peerStream struct {
+		peer turntf.UserRef
+		port *streamPort
+	}
 	r.streamMu.RLock()
-	ports := make([]*streamPort, 0, len(r.streamPorts))
-	for _, port := range r.streamPorts {
-		ports = append(ports, port)
+	ports := make([]peerStream, 0, len(r.streamPorts))
+	for peer, port := range r.streamPorts {
+		ports = append(ports, peerStream{peer: peer, port: port})
 	}
 	r.streamMu.RUnlock()
-	for _, port := range ports {
-		port.markPathLost()
+	for _, item := range ports {
+		item.port.markPathLost()
+		r.deactivateStreamIfNotReady(item.peer, item.port)
 	}
 	if len(ports) > 0 && reason != nil {
 		r.logf("stream transport invalidated %d paths: %v", len(ports), reason)
@@ -653,20 +666,22 @@ func (h runtimeHandler) OnStreamSendResult(_ context.Context, result turntf.Stre
 	r := h.runtime
 	peer := result.Metadata.Target
 	failedSession := result.Metadata.TargetSession
+	r.streamMu.RLock()
+	port := r.streamPorts[peer]
+	r.streamMu.RUnlock()
+	if port == nil || port.id != result.Metadata.StreamID {
+		return
+	}
+	if !port.failPath(failedSession, result.Metadata.Epoch, result.Err) {
+		return
+	}
+	r.deactivateStreamIfNotReady(peer, port)
 	r.streamMu.Lock()
-	if r.preferredStreams[peer] == failedSession {
+	if r.streamPorts[peer] == port && r.preferredStreams[peer] == failedSession {
 		delete(r.preferredStreams, peer)
 	}
-	port := r.streamPorts[peer]
 	r.streamMu.Unlock()
-	if port == nil {
-		return
-	}
-	if !port.failPath(failedSession, result.Err) {
-		return
-	}
 	r.logf("stream send to %d:%d session=%d/%s failed: %v", peer.NodeID, peer.UserID, failedSession.ServingNodeID, failedSession.SessionID, result.Err)
-	r.closeRelayPeer(peer)
 }
 func (h runtimeHandler) OnRelayOrphan(_ context.Context, relayID string, kind turntf.RelayKind) {
 	if h.runtime != nil {
@@ -757,6 +772,26 @@ func (h runtimeHandler) OnStream(ctx context.Context, packet turntf.Packet, fram
 		if receiver != nil {
 			if ack, err := receiver.state.Resume(frame.Epoch, frame.Offset); err == nil {
 				receiver.setSession(packet.TargetSession)
+				var lostPort *streamPort
+				if !packet.TargetSession.IsZero() {
+					r.streamMu.Lock()
+					if r.preferredStreams == nil {
+						r.preferredStreams = make(map[turntf.UserRef]turntf.SessionRef)
+					}
+					r.preferredStreams[packet.Sender] = packet.TargetSession
+					if port := r.streamPorts[packet.Sender]; port != nil {
+						session, _ := port.currentPath()
+						if session != packet.TargetSession {
+							lostPort = port
+						}
+					}
+					r.streamMu.Unlock()
+				}
+				if lostPort != nil {
+					lostPort.markPathLost()
+					r.deactivateStreamIfNotReady(packet.Sender, lostPort)
+					r.logf("stream peer %d:%d resumed from new session; recovering outbound stream", packet.Sender.NodeID, packet.Sender.UserID)
+				}
 				_, _ = r.sendStreamFrame(ctx, receiver.peer, receiver.session(), ack)
 			}
 		}
