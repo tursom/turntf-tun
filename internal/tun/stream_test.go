@@ -328,8 +328,17 @@ func TestTrackedStreamErrorInvalidatesOnlyMatchingPeerSession(t *testing.T) {
 		port.readyState = true
 		close(port.ready)
 	}
+	failedRelay := newFakeRelayConn("failed-relay")
+	healthyRelay := newFakeRelayConn("healthy-relay")
+	failedRelayPort := &peerPort{conn: failedRelay, done: make(chan struct{})}
+	healthyRelayPort := &peerPort{conn: healthyRelay, done: make(chan struct{})}
 	r := &Runtime{
 		streamPorts: map[turntf.UserRef]*streamPort{failedPeer: failed, healthyPeer: healthy},
+		ports:       map[turntf.UserRef]*peerPort{failedPeer: failedRelayPort, healthyPeer: healthyRelayPort},
+		relayPorts: map[turntf.UserRef]map[string]*peerPort{
+			failedPeer:  {failedRelay.RelayID(): failedRelayPort},
+			healthyPeer: {healthyRelay.RelayID(): healthyRelayPort},
+		},
 		preferredStreams: map[turntf.UserRef]turntf.SessionRef{
 			failedPeer:  failedSession,
 			healthyPeer: healthySession,
@@ -356,6 +365,16 @@ func TestTrackedStreamErrorInvalidatesOnlyMatchingPeerSession(t *testing.T) {
 	}
 	if !healthy.readyState {
 		t.Fatal("healthy peer was marked not ready")
+	}
+	select {
+	case <-failedRelay.closed:
+	default:
+		t.Fatal("failed peer stale Relay was not closed")
+	}
+	select {
+	case <-healthyRelay.closed:
+		t.Fatal("healthy peer Relay was closed")
+	default:
 	}
 	r.streamMu.RLock()
 	_, failedPreferred := r.preferredStreams[failedPeer]

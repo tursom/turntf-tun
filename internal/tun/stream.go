@@ -519,6 +519,22 @@ type streamReceiver struct {
 	receivedOnce  sync.Once
 }
 
+func (r *Runtime) closeRelayPeer(peer turntf.UserRef) {
+	r.mu.RLock()
+	connections := r.relayPorts[peer]
+	ports := make([]*peerPort, 0, len(connections))
+	for _, port := range connections {
+		ports = append(ports, port)
+	}
+	if len(ports) == 0 && r.ports[peer] != nil {
+		ports = append(ports, r.ports[peer])
+	}
+	r.mu.RUnlock()
+	for _, port := range ports {
+		port.close()
+	}
+}
+
 func (r *Runtime) markAllStreamPathsLost(reason error) {
 	r.streamMu.RLock()
 	ports := make([]*streamPort, 0, len(r.streamPorts))
@@ -570,6 +586,7 @@ func (h runtimeHandler) OnStreamSendResult(_ context.Context, result turntf.Stre
 		return
 	}
 	r.logf("stream send to %d:%d session=%d/%s failed: %v", peer.NodeID, peer.UserID, failedSession.ServingNodeID, failedSession.SessionID, result.Err)
+	r.closeRelayPeer(peer)
 	port.markPathLost()
 }
 func (h runtimeHandler) OnRelayOrphan(_ context.Context, relayID string, kind turntf.RelayKind) {
