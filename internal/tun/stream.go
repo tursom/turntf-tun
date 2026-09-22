@@ -18,6 +18,8 @@ const (
 
 var streamPacketMagic = [2]byte{0x54, 0x50}
 
+var errStreamAckStalled = errors.New("stream acknowledgement stalled")
+
 func encodeStreamBatch(first []byte, queue <-chan []byte) ([]byte, []byte) {
 	batch := make([]byte, 0, len(first)+8)
 	batch = append(batch, streamPacketMagic[:]...)
@@ -96,6 +98,7 @@ type streamPort struct {
 	resumeReady   chan struct{}
 	epoch         uint64
 	lastAck       uint64
+	lastWindow    uint64
 	pathMu        sync.Mutex
 	attemptErr    chan error
 	ctx           context.Context
@@ -140,6 +143,15 @@ func (p *streamPort) dataForReadyPath(payload []byte) (turntf.SessionRef, turntf
 	return p.targetSession, frame, err, true
 }
 
+func (p *streamPort) ackProgress(session turntf.SessionRef) (uint64, uint64, uint64, bool) {
+	p.pathMu.Lock()
+	defer p.pathMu.Unlock()
+	if !p.readyState || p.targetSession != session {
+		return 0, 0, 0, false
+	}
+	return p.epoch, p.lastAck, p.lastWindow, true
+}
+
 func (p *streamPort) beginOpen(session turntf.SessionRef) (<-chan struct{}, <-chan error) {
 	p.pathMu.Lock()
 	defer p.pathMu.Unlock()
@@ -163,6 +175,27 @@ func (p *streamPort) acceptOpenAck(session turntf.SessionRef, epoch uint64) bool
 func (p *streamPort) failPath(session turntf.SessionRef, epoch uint64, err error) bool {
 	p.pathMu.Lock()
 	if p.targetSession != session || p.epoch != epoch {
+		p.pathMu.Unlock()
+		return false
+	}
+	if !p.readyState {
+		select {
+		case p.attemptErr <- err:
+		default:
+		}
+		p.pathMu.Unlock()
+		return true
+	}
+	p.readyState = false
+	p.ready = make(chan struct{})
+	p.pathMu.Unlock()
+	p.signalPathLost()
+	return true
+}
+
+func (p *streamPort) failPathIfAckUnchanged(session turntf.SessionRef, epoch, expectedAck, expectedWindow uint64, err error) bool {
+	p.pathMu.Lock()
+	if p.targetSession != session || p.epoch != epoch || p.lastAck != expectedAck || p.lastWindow != expectedWindow {
 		p.pathMu.Unlock()
 		return false
 	}
@@ -248,6 +281,9 @@ func (p *streamPort) acknowledge(session turntf.SessionRef, frame turntf.StreamF
 	}
 	if frame.Offset > p.lastAck {
 		p.lastAck = frame.Offset
+	}
+	if frame.Window > 0 {
+		p.lastWindow = frame.Window
 	}
 	if p.resumeReady != nil {
 		select {
@@ -602,6 +638,7 @@ func (r *Runtime) recoverStream(ctx context.Context, peer PeerConfig, p *streamP
 func (r *Runtime) writeStreamLoop(p *streamPort) {
 	var pending []byte
 	var overflow []byte
+	var stalled streamWindowStall
 	for {
 		if pending == nil {
 			var first []byte
@@ -628,12 +665,28 @@ func (r *Runtime) writeStreamLoop(p *streamPort) {
 		}
 		if err != nil {
 			if err == turntf.ErrStreamWindowFull {
-				time.Sleep(time.Millisecond)
+				epoch, lastAck, lastWindow, current := p.ackProgress(session)
+				if !current {
+					stalled.reset()
+					continue
+				}
+				if stalled.observe(session, epoch, lastAck, lastWindow, time.Now(), r.streamAttemptTimeout()) {
+					if p.failPathIfAckUnchanged(session, epoch, lastAck, lastWindow, errStreamAckStalled) {
+						r.logf("stream acknowledgements from %d:%d session=%d/%s stalled at offset %d", p.peer.NodeID, p.peer.UserID, session.ServingNodeID, session.SessionID, lastAck)
+					}
+					stalled.reset()
+					continue
+				}
+				if !sleepContext(p.ctx, time.Millisecond) {
+					return
+				}
 				continue
 			}
+			stalled.reset()
 			p.failPath(session, frame.Epoch, err)
 			continue
 		}
+		stalled.reset()
 		pending = nil
 		if _, err = r.sendStreamFrame(p.ctx, p.peer, session, frame); err != nil {
 			p.failPath(session, frame.Epoch, err)
@@ -641,6 +694,30 @@ func (r *Runtime) writeStreamLoop(p *streamPort) {
 			p.sentOnce.Do(func() { r.logf("stream data sent to %d:%d", p.peer.NodeID, p.peer.UserID) })
 		}
 	}
+}
+
+type streamWindowStall struct {
+	session turntf.SessionRef
+	epoch   uint64
+	ack     uint64
+	window  uint64
+	since   time.Time
+}
+
+func (s *streamWindowStall) observe(session turntf.SessionRef, epoch, ack, window uint64, now time.Time, timeout time.Duration) bool {
+	if s.since.IsZero() || s.session != session || s.epoch != epoch || s.ack != ack || s.window != window {
+		s.session = session
+		s.epoch = epoch
+		s.ack = ack
+		s.window = window
+		s.since = now
+		return false
+	}
+	return now.Sub(s.since) >= timeout
+}
+
+func (s *streamWindowStall) reset() {
+	*s = streamWindowStall{}
 }
 
 type streamReceiver struct {

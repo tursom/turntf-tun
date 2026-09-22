@@ -711,6 +711,94 @@ func TestWriteStreamLoopUsesRecoveredSessionAfterWaitingForPacket(t *testing.T) 
 	waitForDone(t, done, "stream writer did not stop")
 }
 
+func TestWriteStreamLoopInvalidatesPathWhenAcknowledgementsStall(t *testing.T) {
+	peer := turntf.UserRef{NodeID: 2, UserID: 3}
+	session := turntf.SessionRef{ServingNodeID: 4, SessionID: "stalled"}
+	port := testStreamPort()
+	port.peer = peer
+	port.targetSession = session
+	port.sender = turntf.NewStreamSenderState(port.id, 1, 1)
+	port.readyState = true
+	close(port.ready)
+	r := &Runtime{streamTimeout: 5 * time.Millisecond}
+	done := make(chan struct{})
+	go func() {
+		r.writeStreamLoop(port)
+		close(done)
+	}()
+	port.queue <- []byte("blocked")
+	select {
+	case <-port.lost:
+	case <-time.After(time.Second):
+		t.Fatal("stalled acknowledgement did not invalidate path")
+	}
+	if port.readyState {
+		t.Fatal("stalled acknowledgement left path ready")
+	}
+	port.close()
+	waitForDone(t, done, "stream writer did not stop")
+}
+
+func TestStreamWindowStallRequiresContinuousLackOfProgress(t *testing.T) {
+	session := turntf.SessionRef{ServingNodeID: 4, SessionID: "session"}
+	other := turntf.SessionRef{ServingNodeID: 4, SessionID: "other"}
+	start := time.Unix(100, 0)
+	timeout := 5 * time.Second
+	var stalled streamWindowStall
+	if stalled.observe(session, 1, 0, 10, start, timeout) {
+		t.Fatal("first full-window observation reported a stall")
+	}
+	if stalled.observe(session, 1, 1, 10, start.Add(timeout), timeout) {
+		t.Fatal("acknowledgement progress did not reset stall timer")
+	}
+	if stalled.observe(session, 1, 1, 20, start.Add(2*timeout), timeout) {
+		t.Fatal("window credit progress did not reset stall timer")
+	}
+	if stalled.observe(session, 2, 1, 20, start.Add(3*timeout), timeout) {
+		t.Fatal("epoch change did not reset stall timer")
+	}
+	if stalled.observe(other, 2, 1, 20, start.Add(4*timeout), timeout) {
+		t.Fatal("session change did not reset stall timer")
+	}
+	if stalled.observe(other, 2, 1, 20, start.Add(5*timeout-time.Nanosecond), timeout) {
+		t.Fatal("stall reported before a full timeout")
+	}
+	if !stalled.observe(other, 2, 1, 20, start.Add(5*timeout), timeout) {
+		t.Fatal("continuous lack of progress did not report a stall")
+	}
+}
+
+func TestStreamWindowStallDoesNotInvalidatePathAfterConcurrentAck(t *testing.T) {
+	session := turntf.SessionRef{ServingNodeID: 4, SessionID: "session"}
+	port := testStreamPort()
+	port.targetSession = session
+	port.readyState = true
+	close(port.ready)
+	if _, err := port.sender.Data([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+
+	// The writer observed ack=0/window=0 as stalled, but a credit update won
+	// the race before conditional path invalidation acquired pathMu.
+	port.acknowledge(session, turntf.StreamFrame{Kind: turntf.StreamFrameAck, ID: port.id, Epoch: 1, Offset: 0, Window: 2048})
+	if port.failPathIfAckUnchanged(session, 1, 0, 0, errStreamAckStalled) {
+		t.Fatal("stale stall observation invalidated path after window progress")
+	}
+	// Offset progress is protected by the same atomic comparison.
+	port.acknowledge(session, turntf.StreamFrame{Kind: turntf.StreamFrameAck, ID: port.id, Epoch: 1, Offset: 1, Window: 2048})
+	if port.failPathIfAckUnchanged(session, 1, 0, 2048, errStreamAckStalled) {
+		t.Fatal("stale stall observation invalidated path after offset progress")
+	}
+	if !port.readyState || port.lastAck != 1 || port.lastWindow != 2048 {
+		t.Fatalf("path changed after stale stall observation: ready=%v ack=%d window=%d", port.readyState, port.lastAck, port.lastWindow)
+	}
+	select {
+	case <-port.lost:
+		t.Fatal("stale stall observation signaled path loss")
+	default:
+	}
+}
+
 func TestResumeKeepsReadyChannelForWaitingWriter(t *testing.T) {
 	peer := turntf.UserRef{NodeID: 2, UserID: 3}
 	oldSession := turntf.SessionRef{ServingNodeID: 4, SessionID: "old"}
