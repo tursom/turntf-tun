@@ -3,6 +3,7 @@ package tun
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"sync"
 	"time"
 
@@ -129,6 +130,16 @@ func (p *streamPort) enqueueReady(packet []byte) bool {
 	}
 	return p.enqueue(packet)
 }
+func (p *streamPort) dataForReadyPath(payload []byte) (turntf.SessionRef, turntf.StreamFrame, error, bool) {
+	p.pathMu.Lock()
+	defer p.pathMu.Unlock()
+	if !p.readyState {
+		return turntf.SessionRef{}, turntf.StreamFrame{}, nil, false
+	}
+	frame, err := p.sender.Data(payload)
+	return p.targetSession, frame, err, true
+}
+
 func (p *streamPort) beginOpen(session turntf.SessionRef) (<-chan struct{}, <-chan error) {
 	p.pathMu.Lock()
 	defer p.pathMu.Unlock()
@@ -163,21 +174,36 @@ func (p *streamPort) failPath(session turntf.SessionRef, epoch uint64, err error
 		p.pathMu.Unlock()
 		return true
 	}
+	p.readyState = false
+	p.ready = make(chan struct{})
 	p.pathMu.Unlock()
-	p.markPathLost()
+	p.signalPathLost()
 	return true
 }
+
 func (p *streamPort) markPathLost() {
+	p.markPathLostWithError(nil)
+}
+
+func (p *streamPort) markPathLostWithError(err error) {
 	p.pathMu.Lock()
-	wasReady := p.readyState
-	if wasReady {
-		p.readyState = false
-		p.ready = make(chan struct{})
-	}
-	p.pathMu.Unlock()
-	if !wasReady {
+	if !p.readyState {
+		if err != nil {
+			select {
+			case p.attemptErr <- err:
+			default:
+			}
+		}
+		p.pathMu.Unlock()
 		return
 	}
+	p.readyState = false
+	p.ready = make(chan struct{})
+	p.pathMu.Unlock()
+	p.signalPathLost()
+}
+
+func (p *streamPort) signalPathLost() {
 	select {
 	case p.lost <- struct{}{}:
 	default:
@@ -188,8 +214,10 @@ func (p *streamPort) beginResume(session turntf.SessionRef, epoch uint64) (uint6
 	defer p.pathMu.Unlock()
 	p.targetSession = session
 	p.epoch = epoch
-	p.readyState = false
-	p.ready = make(chan struct{})
+	if p.readyState {
+		p.readyState = false
+		p.ready = make(chan struct{})
+	}
 	p.resumeReady = make(chan struct{}, 1)
 	p.attemptErr = make(chan error, 1)
 	return p.lastAck, p.resumeReady, p.attemptErr
@@ -222,14 +250,28 @@ func (p *streamPort) acknowledge(session turntf.SessionRef, frame turntf.StreamF
 		p.lastAck = frame.Offset
 	}
 	if p.resumeReady != nil {
-		p.readyState = true
-		close(p.ready)
 		select {
 		case p.resumeReady <- struct{}{}:
 		default:
 		}
 		p.resumeReady = nil
 	}
+}
+
+func (p *streamPort) completeResume(session turntf.SessionRef, epoch uint64) bool {
+	p.pathMu.Lock()
+	defer p.pathMu.Unlock()
+	if p.targetSession != session || p.epoch != epoch || p.readyState || p.resumeReady != nil {
+		return false
+	}
+	select {
+	case <-p.attemptErr:
+		return false
+	default:
+	}
+	p.readyState = true
+	close(p.ready)
+	return true
 }
 func (p *streamPort) requestRestart(session turntf.SessionRef) bool {
 	p.pathMu.Lock()
@@ -538,7 +580,7 @@ func (r *Runtime) recoverStream(ctx context.Context, peer PeerConfig, p *streamP
 							break
 						}
 					}
-					if err == nil {
+					if err == nil && p.completeResume(session, epoch) {
 						return true
 					}
 				case <-attemptErr:
@@ -561,15 +603,6 @@ func (r *Runtime) writeStreamLoop(p *streamPort) {
 	var pending []byte
 	var overflow []byte
 	for {
-		session, ready := p.currentPath()
-		select {
-		case <-p.done:
-			return
-		case <-ready:
-		}
-		if !p.isReady(ready) {
-			continue
-		}
 		if pending == nil {
 			var first []byte
 			if overflow != nil {
@@ -583,18 +616,27 @@ func (r *Runtime) writeStreamLoop(p *streamPort) {
 			}
 			pending, overflow = encodeStreamBatch(first, p.queue)
 		}
-		frame, err := p.sender.Data(pending)
+		_, ready := p.currentPath()
+		select {
+		case <-p.done:
+			return
+		case <-ready:
+		}
+		session, frame, err, pathReady := p.dataForReadyPath(pending)
+		if !pathReady {
+			continue
+		}
 		if err != nil {
 			if err == turntf.ErrStreamWindowFull {
 				time.Sleep(time.Millisecond)
 				continue
 			}
-			p.markPathLost()
+			p.failPath(session, frame.Epoch, err)
 			continue
 		}
 		pending = nil
 		if _, err = r.sendStreamFrame(p.ctx, p.peer, session, frame); err != nil {
-			p.markPathLost()
+			p.failPath(session, frame.Epoch, err)
 		} else {
 			p.sentOnce.Do(func() { r.logf("stream data sent to %d:%d", p.peer.NodeID, p.peer.UserID) })
 		}
@@ -636,7 +678,7 @@ func (r *Runtime) markAllStreamPathsLost(reason error) {
 	}
 	r.streamMu.RUnlock()
 	for _, item := range ports {
-		item.port.markPathLost()
+		item.port.markPathLostWithError(reason)
 		r.deactivateStreamIfNotReady(item.peer, item.port)
 	}
 	if len(ports) > 0 && reason != nil {
@@ -788,7 +830,7 @@ func (h runtimeHandler) OnStream(ctx context.Context, packet turntf.Packet, fram
 					r.streamMu.Unlock()
 				}
 				if lostPort != nil {
-					lostPort.markPathLost()
+					lostPort.markPathLostWithError(errors.New("peer session changed"))
 					r.deactivateStreamIfNotReady(packet.Sender, lostPort)
 					r.logf("stream peer %d:%d resumed from new session; recovering outbound stream", packet.Sender.NodeID, packet.Sender.UserID)
 				}

@@ -410,7 +410,18 @@ func TestStreamPortResumeKeepsIDAndPendingSuffix(t *testing.T) {
 	select {
 	case <-ready:
 	default:
-		t.Fatal("resume ACK did not release path")
+		t.Fatal("resume ACK did not release replay")
+	}
+	if p.readyState {
+		t.Fatal("resume ACK opened path before pending replay completed")
+	}
+	if !p.completeResume(session, 2) {
+		t.Fatal("pending replay did not complete Resume")
+	}
+	select {
+	case <-p.ready:
+	default:
+		t.Fatal("completed Resume did not release path")
 	}
 	if got := <-p.queue; string(got) != "queued" {
 		t.Fatalf("queued packet = %q", got)
@@ -652,6 +663,273 @@ func TestTrackedStreamErrorForOldEpochDoesNotInvalidateResumedPath(t *testing.T)
 	if !port.readyState || r.activeStreams[peer] != port || r.preferredStreams[peer] != session {
 		t.Fatal("late old-epoch error changed resumed path state")
 	}
+}
+
+func TestWriteStreamLoopUsesRecoveredSessionAfterWaitingForPacket(t *testing.T) {
+	peer := turntf.UserRef{NodeID: 2, UserID: 3}
+	oldSession := turntf.SessionRef{ServingNodeID: 4, SessionID: "old"}
+	newSession := turntf.SessionRef{ServingNodeID: 4, SessionID: "new"}
+	port := testStreamPort()
+	port.peer = peer
+	port.targetSession = oldSession
+	port.readyState = true
+	close(port.ready)
+	sent := make(chan sentStreamFrame, 1)
+	r := &Runtime{streamSend: func(_ context.Context, _ turntf.UserRef, session turntf.SessionRef, frame turntf.StreamFrame, _ turntf.DeliveryMode) (turntf.RelayAccepted, error) {
+		sent <- sentStreamFrame{session: session, frame: frame}
+		return turntf.RelayAccepted{}, nil
+	}}
+	done := make(chan struct{})
+	go func() {
+		r.writeStreamLoop(port)
+		close(done)
+	}()
+
+	// Let the writer reach its empty-queue wait on the original path.
+	time.Sleep(20 * time.Millisecond)
+	port.markPathLost()
+	_, _, _ = port.beginResume(newSession, 2)
+	if _, err := port.sender.Resume(2, 0); err != nil {
+		t.Fatal(err)
+	}
+	port.acknowledge(newSession, turntf.StreamFrame{Kind: turntf.StreamFrameAck, ID: port.id, Epoch: 2, Offset: 0, Window: turntf.DefaultStreamWindow})
+	if !port.completeResume(newSession, 2) {
+		t.Fatal("complete Resume")
+	}
+	port.queue <- []byte("after-recovery")
+
+	select {
+	case got := <-sent:
+		packets, batched := decodeStreamBatch(got.frame.Payload)
+		if got.session != newSession || got.frame.Epoch != 2 || !batched || len(packets) != 1 || string(packets[0]) != "after-recovery" {
+			t.Fatalf("post-recovery send = %+v packets=%q, want new session at epoch 2", got, packets)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("post-recovery packet was not sent")
+	}
+	port.close()
+	waitForDone(t, done, "stream writer did not stop")
+}
+
+func TestResumeKeepsReadyChannelForWaitingWriter(t *testing.T) {
+	peer := turntf.UserRef{NodeID: 2, UserID: 3}
+	oldSession := turntf.SessionRef{ServingNodeID: 4, SessionID: "old"}
+	newSession := turntf.SessionRef{ServingNodeID: 4, SessionID: "new"}
+	port := testStreamPort()
+	port.peer = peer
+	port.targetSession = oldSession
+	port.readyState = true
+	close(port.ready)
+	port.markPathLost()
+	waitingReady := port.ready
+	port.queue <- []byte("waiting")
+	sent := make(chan sentStreamFrame, 1)
+	r := &Runtime{streamSend: func(_ context.Context, _ turntf.UserRef, session turntf.SessionRef, frame turntf.StreamFrame, _ turntf.DeliveryMode) (turntf.RelayAccepted, error) {
+		sent <- sentStreamFrame{session: session, frame: frame}
+		return turntf.RelayAccepted{}, nil
+	}}
+	done := make(chan struct{})
+	go func() {
+		r.writeStreamLoop(port)
+		close(done)
+	}()
+	time.Sleep(20 * time.Millisecond)
+	_, _, _ = port.beginResume(newSession, 2)
+	if port.ready != waitingReady {
+		t.Fatal("beginResume replaced the channel held by a waiting writer")
+	}
+	if _, err := port.sender.Resume(2, 0); err != nil {
+		t.Fatal(err)
+	}
+	port.acknowledge(newSession, turntf.StreamFrame{Kind: turntf.StreamFrameAck, ID: port.id, Epoch: 2, Offset: 0, Window: turntf.DefaultStreamWindow})
+	if !port.completeResume(newSession, 2) {
+		t.Fatal("complete Resume")
+	}
+	select {
+	case got := <-sent:
+		if got.session != newSession || got.frame.Epoch != 2 {
+			t.Fatalf("waiting writer used stale path: %+v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waiting writer was not released by completed Resume")
+	}
+	port.close()
+	waitForDone(t, done, "stream writer did not stop")
+}
+
+func TestResumeReplayFailureDoesNotOpenWriter(t *testing.T) {
+	port := testStreamPort()
+	session := turntf.SessionRef{ServingNodeID: 4, SessionID: "new"}
+	port.readyState = true
+	close(port.ready)
+	port.markPathLost()
+	_, replayReady, _ := port.beginResume(session, 2)
+	if _, err := port.sender.Resume(2, 0); err != nil {
+		t.Fatal(err)
+	}
+	port.acknowledge(session, turntf.StreamFrame{Kind: turntf.StreamFrameAck, ID: port.id, Epoch: 2, Offset: 0, Window: turntf.DefaultStreamWindow})
+	select {
+	case <-replayReady:
+	default:
+		t.Fatal("Resume ACK did not release replay")
+	}
+	if !port.failPath(session, 2, errors.New("replay delivery failed")) {
+		t.Fatal("replay failure did not match current path")
+	}
+	if port.completeResume(session, 2) {
+		t.Fatal("failed replay opened writer")
+	}
+	if port.readyState {
+		t.Fatal("failed replay left path ready")
+	}
+	select {
+	case <-port.ready:
+		t.Fatal("failed replay closed writer ready channel")
+	default:
+	}
+}
+
+func TestTransportLossDuringResumeDoesNotOpenWriter(t *testing.T) {
+	port := testStreamPort()
+	session := turntf.SessionRef{ServingNodeID: 4, SessionID: "new"}
+	port.readyState = true
+	close(port.ready)
+	port.markPathLost()
+	_, replayReady, _ := port.beginResume(session, 2)
+	if _, err := port.sender.Resume(2, 0); err != nil {
+		t.Fatal(err)
+	}
+	port.acknowledge(session, turntf.StreamFrame{Kind: turntf.StreamFrameAck, ID: port.id, Epoch: 2, Offset: 0, Window: turntf.DefaultStreamWindow})
+	select {
+	case <-replayReady:
+	default:
+		t.Fatal("Resume ACK did not release replay")
+	}
+	port.markPathLostWithError(errors.New("transport disconnected"))
+	if port.completeResume(session, 2) {
+		t.Fatal("transport loss during Resume opened writer")
+	}
+	select {
+	case <-port.ready:
+		t.Fatal("transport loss closed writer ready channel")
+	default:
+	}
+}
+
+func TestOldSynchronousSendErrorDoesNotInvalidateRecoveredPath(t *testing.T) {
+	peer := turntf.UserRef{NodeID: 2, UserID: 3}
+	oldSession := turntf.SessionRef{ServingNodeID: 4, SessionID: "old"}
+	newSession := turntf.SessionRef{ServingNodeID: 4, SessionID: "new"}
+	port := testStreamPort()
+	port.peer = peer
+	port.targetSession = oldSession
+	port.readyState = true
+	close(port.ready)
+	sendEntered := make(chan struct{})
+	releaseSend := make(chan struct{})
+	r := &Runtime{streamSend: func(context.Context, turntf.UserRef, turntf.SessionRef, turntf.StreamFrame, turntf.DeliveryMode) (turntf.RelayAccepted, error) {
+		close(sendEntered)
+		<-releaseSend
+		return turntf.RelayAccepted{}, errors.New("old path send failed")
+	}}
+	done := make(chan struct{})
+	go func() {
+		r.writeStreamLoop(port)
+		close(done)
+	}()
+	port.queue <- []byte("old-path")
+	waitForDone(t, sendEntered, "old path send did not start")
+	port.markPathLost()
+	_, _, _ = port.beginResume(newSession, 2)
+	if _, err := port.sender.Resume(2, 0); err != nil {
+		t.Fatal(err)
+	}
+	port.acknowledge(newSession, turntf.StreamFrame{Kind: turntf.StreamFrameAck, ID: port.id, Epoch: 2, Offset: 0, Window: turntf.DefaultStreamWindow})
+	if !port.completeResume(newSession, 2) {
+		t.Fatal("complete new path Resume")
+	}
+	close(releaseSend)
+	time.Sleep(20 * time.Millisecond)
+	if !port.readyState || port.targetSession != newSession || port.epoch != 2 {
+		t.Fatalf("old send error invalidated recovered path: ready=%v session=%+v epoch=%d", port.readyState, port.targetSession, port.epoch)
+	}
+	port.close()
+	waitForDone(t, done, "stream writer did not stop")
+}
+
+func TestRecoverStreamReplaysPendingBeforeNewData(t *testing.T) {
+	peerRef := turntf.UserRef{NodeID: 2, UserID: 3}
+	peer := PeerConfig{Name: "peer", User: UserRefConfig{NodeID: peerRef.NodeID, UserID: peerRef.UserID}}
+	oldSession := turntf.SessionRef{ServingNodeID: 4, SessionID: "old"}
+	newSession := turntf.SessionRef{ServingNodeID: 4, SessionID: "new"}
+	port := testStreamPort()
+	port.peer = peerRef
+	port.targetSession = oldSession
+	port.readyState = true
+	close(port.ready)
+	oldFrame, err := port.sender.Data([]byte("old-pending"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	port.markPathLost()
+
+	replayEntered := make(chan struct{})
+	releaseReplay := make(chan struct{})
+	newData := make(chan turntf.StreamFrame, 1)
+	r := &Runtime{
+		cfg: Config{Transport: TransportConfig{DialRetryInterval: Duration{Duration: time.Millisecond}}},
+		streamResolve: func(context.Context, turntf.UserRef) (turntf.ResolvedUserSessions, error) {
+			return turntf.ResolvedUserSessions{Sessions: []turntf.ResolvedSession{{Session: newSession, TransientCapable: true}}}, nil
+		},
+	}
+	r.streamSend = func(_ context.Context, _ turntf.UserRef, session turntf.SessionRef, frame turntf.StreamFrame, _ turntf.DeliveryMode) (turntf.RelayAccepted, error) {
+		switch frame.Kind {
+		case turntf.StreamFrameResume:
+			go port.acknowledge(session, turntf.StreamFrame{Kind: turntf.StreamFrameAck, ID: port.id, Epoch: frame.Epoch, Offset: 0, Window: turntf.DefaultStreamWindow})
+		case turntf.StreamFrameData:
+			if frame.Offset == oldFrame.Offset {
+				close(replayEntered)
+				<-releaseReplay
+			} else {
+				newData <- frame
+			}
+		}
+		return turntf.RelayAccepted{}, nil
+	}
+	writerDone := make(chan struct{})
+	go func() {
+		r.writeStreamLoop(port)
+		close(writerDone)
+	}()
+	recovered := make(chan bool, 1)
+	go func() { recovered <- r.recoverStream(context.Background(), peer, port) }()
+	waitForDone(t, replayEntered, "pending replay did not start")
+	port.queue <- []byte("new-data")
+	select {
+	case frame := <-newData:
+		t.Fatalf("new Data overtook pending replay: %+v", frame)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseReplay)
+	select {
+	case ok := <-recovered:
+		if !ok {
+			t.Fatal("stream recovery failed")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stream recovery did not finish")
+	}
+	select {
+	case frame := <-newData:
+		wantOffset := oldFrame.Offset + uint64(len(oldFrame.Payload))
+		if frame.Offset != wantOffset {
+			t.Fatalf("new Data offset = %d, want %d", frame.Offset, wantOffset)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("new Data was not sent after pending replay")
+	}
+	port.close()
+	waitForDone(t, writerDone, "stream writer did not stop")
 }
 
 func TestStreamPortPathLossPreservesQueueAndSignalsRecovery(t *testing.T) {
