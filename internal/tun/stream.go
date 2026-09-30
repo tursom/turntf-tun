@@ -99,6 +99,7 @@ type streamPort struct {
 	epoch         uint64
 	lastAck       uint64
 	lastWindow    uint64
+	lastSent      uint64
 	pathMu        sync.Mutex
 	attemptErr    chan error
 	ctx           context.Context
@@ -140,7 +141,16 @@ func (p *streamPort) dataForReadyPath(payload []byte) (turntf.SessionRef, turntf
 		return turntf.SessionRef{}, turntf.StreamFrame{}, nil, false
 	}
 	frame, err := p.sender.Data(payload)
+	if err == nil {
+		p.lastSent = frame.Offset + uint64(len(frame.Payload))
+	}
 	return p.targetSession, frame, err, true
+}
+
+func (p *streamPort) outstandingAckProgress() (turntf.SessionRef, uint64, uint64, uint64, bool) {
+	p.pathMu.Lock()
+	defer p.pathMu.Unlock()
+	return p.targetSession, p.epoch, p.lastAck, p.lastWindow, p.readyState && p.lastSent > p.lastAck
 }
 
 func (p *streamPort) ackProgress(session turntf.SessionRef) (uint64, uint64, uint64, bool) {
@@ -352,6 +362,11 @@ const (
 )
 
 func (r *Runtime) resolveStreamSessions(ctx context.Context, peer turntf.UserRef) (turntf.ResolvedUserSessions, error) {
+	// RequestTimeout in the SDK bounds writes, not the wait for an RPC reply.
+	// Bound discovery separately so a live but unresponsive connection cannot
+	// hold this peer's Open/Resume lifecycle forever.
+	ctx, cancel := context.WithTimeout(ctx, r.requestAttemptTimeout())
+	defer cancel()
 	if r.streamResolve != nil {
 		return r.streamResolve(ctx, peer)
 	}
@@ -593,45 +608,52 @@ func (r *Runtime) deactivateStreamIfNotReady(peer turntf.UserRef, stream *stream
 }
 
 func (r *Runtime) recoverStream(ctx context.Context, peer PeerConfig, p *streamPort) bool {
-	for ctx.Err() == nil {
-		sessions, err := r.resolveStreamSessions(ctx, p.peer)
-		if err == nil {
-			for _, session := range transientStreamSessions(sessions) {
-				epoch := p.nextEpoch()
-				lastAck, resumeReady, attemptErr := p.beginResume(session, epoch)
-				frames, resumeErr := p.sender.Resume(epoch, lastAck)
-				if resumeErr != nil {
-					return false
-				}
-				resume := turntf.StreamFrame{Kind: turntf.StreamFrameResume, ID: p.id, Epoch: epoch, Offset: lastAck}
-				if _, err = r.sendStreamFrame(ctx, p.peer, session, resume); err != nil {
-					continue
-				}
-				timer := time.NewTimer(r.streamAttemptTimeout())
-				select {
-				case <-resumeReady:
-					timer.Stop()
-					for _, frame := range frames {
-						if _, err = r.sendStreamFrame(ctx, p.peer, session, frame); err != nil {
-							break
-						}
-					}
-					if err == nil && p.completeResume(session, epoch) {
-						return true
-					}
-				case <-attemptErr:
-					timer.Stop()
-				case <-timer.C:
-				case <-ctx.Done():
-					timer.Stop()
-					return false
+	if ctx.Err() != nil {
+		return false
+	}
+	sessions, err := r.resolveStreamSessions(ctx, p.peer)
+	if err != nil {
+		r.logf("resolve stream peer %s during recovery: %v", peer.Name, err)
+		return false
+	}
+	// Resume preserves an existing receiver; it cannot recreate state lost when
+	// the peer restarts. Try each current session once, then let runStream Open
+	// a new ID. The outer lifecycle retains Relay and backs off failed Opens.
+	for _, session := range transientStreamSessions(sessions) {
+		if ctx.Err() != nil {
+			return false
+		}
+		epoch := p.nextEpoch()
+		lastAck, resumeReady, attemptErr := p.beginResume(session, epoch)
+		frames, resumeErr := p.sender.Resume(epoch, lastAck)
+		if resumeErr != nil {
+			return false
+		}
+		resume := turntf.StreamFrame{Kind: turntf.StreamFrameResume, ID: p.id, Epoch: epoch, Offset: lastAck}
+		if _, err = r.sendStreamFrame(ctx, p.peer, session, resume); err != nil {
+			continue
+		}
+		timer := time.NewTimer(r.streamAttemptTimeout())
+		select {
+		case <-resumeReady:
+			timer.Stop()
+			for _, frame := range frames {
+				if _, err = r.sendStreamFrame(ctx, p.peer, session, frame); err != nil {
+					break
 				}
 			}
-		}
-		if !sleepContext(ctx, r.cfg.Transport.DialRetryInterval.Duration) {
+			if err == nil && p.completeResume(session, epoch) {
+				return true
+			}
+		case <-attemptErr:
+			timer.Stop()
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
 			return false
 		}
 	}
+	r.logf("stream peer %s recovery candidates exhausted; rebuilding stream", peer.Name)
 	return false
 }
 
@@ -639,6 +661,13 @@ func (r *Runtime) writeStreamLoop(p *streamPort) {
 	var pending []byte
 	var overflow []byte
 	var stalled streamWindowStall
+	var idleStalled streamWindowStall
+	checkInterval := r.streamAttemptTimeout() / 4
+	if checkInterval < time.Millisecond {
+		checkInterval = time.Millisecond
+	}
+	ackCheck := time.NewTicker(checkInterval)
+	defer ackCheck.Stop()
 	for {
 		if pending == nil {
 			var first []byte
@@ -648,6 +677,20 @@ func (r *Runtime) writeStreamLoop(p *streamPort) {
 				select {
 				case <-p.done:
 					return
+				case <-ackCheck.C:
+					// Small SYN/DNS requests may never fill the send window. Detect
+					// missing peer ACKs while idle as well, without treating a quiet,
+					// fully acknowledged stream as failed or adding another goroutine.
+					session, epoch, lastAck, lastWindow, outstanding := p.outstandingAckProgress()
+					if !outstanding {
+						idleStalled.reset()
+					} else if idleStalled.observe(session, epoch, lastAck, lastWindow, time.Now(), r.streamAttemptTimeout()) {
+						if p.failPathIfAckUnchanged(session, epoch, lastAck, lastWindow, errStreamAckStalled) {
+							r.logf("idle stream acknowledgements from %d:%d stalled at offset %d", p.peer.NodeID, p.peer.UserID, lastAck)
+						}
+						idleStalled.reset()
+					}
+					continue
 				case first = <-p.queue:
 				}
 			}

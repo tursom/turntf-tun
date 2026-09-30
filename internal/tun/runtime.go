@@ -248,7 +248,11 @@ func (r *Runtime) readTUNLoop(ctx context.Context) {
 func (r *Runtime) dialLoop(ctx context.Context, peer PeerConfig) {
 	target := peer.User.ToTurntf()
 	for ctx.Err() == nil {
-		conn, err := r.relay.Connect(ctx, target, &r.relayCfg)
+		// The deadline covers discovery and OPEN. A successful Relay connection
+		// owns its lifetime independently, so cancelling this attempt is safe.
+		attemptCtx, cancel := context.WithTimeout(ctx, r.requestAttemptTimeout())
+		conn, err := r.relay.Connect(attemptCtx, target, &r.relayCfg)
+		cancel()
 		if err != nil {
 			r.logf("connect peer %s: %v", peer.Name, err)
 			if !sleepContext(ctx, r.cfg.Transport.DialRetryInterval.Duration) {
@@ -263,6 +267,13 @@ func (r *Runtime) dialLoop(ctx context.Context, peer PeerConfig) {
 			return
 		}
 	}
+}
+
+func (r *Runtime) requestAttemptTimeout() time.Duration {
+	if timeout := r.cfg.Turntf.RequestTimeout.Duration; timeout > 0 {
+		return timeout
+	}
+	return 10 * time.Second
 }
 func (r *Runtime) acceptRelay(ctx context.Context, conn *turntf.RelayConnection) {
 	remote := conn.RemotePeer()
