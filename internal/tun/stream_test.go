@@ -42,12 +42,14 @@ func TestStreamBatchRoundTrip(t *testing.T) {
 }
 
 func TestStreamBatchPreservesOverflowPacket(t *testing.T) {
-	first := make([]byte, streamBatchMax-8)
-	queue := make(chan []byte, 1)
+	first := make([]byte, 0xffff)
+	second := make([]byte, streamBatchMax-len(streamPacketMagic)-2-len(first)-2)
+	queue := make(chan []byte, 2)
+	queue <- second
 	queue <- []byte("overflow")
 	payload, overflow := encodeStreamBatch(first, queue)
-	if len(payload) != len(first)+4 {
-		t.Fatalf("batch length = %d, want %d", len(payload), len(first)+4)
+	if len(payload) != streamBatchMax {
+		t.Fatalf("batch length = %d, want %d", len(payload), streamBatchMax)
 	}
 	if string(overflow) != "overflow" {
 		t.Fatalf("overflow = %q, want preserved packet", overflow)

@@ -7,6 +7,8 @@
 - 只传输 IP packet，不传 Ethernet header、MAC、ARP 或广播帧。
 - 每个 peer 配置明确的 CIDR 路由，支持 IPv4 和 IPv6。
 - Relay 使用 `at_least_once`，并在每个 peer 上把 IP packet 聚合成最多 128 KiB 的 batch；acceptance RPC 有界并行，避免高 RTT 链路上逐包等待，同时不引入可靠有序重排。IP 层上面的 TCP/UDP 仍负责自己的语义。
+- Relay 发送通道保持很浅：窗口占满时 `Send` 阻塞，packet 在 peer 队列中积压，下一个 batch 一次吸收积压，使在途数据随负载增大，而不是在 SDK 通道里堆积大量单包小帧；队列满时在 TUN 侧丢包，给内层 TCP 真实拥塞信号。
+- stream 模式的 batch 上限为 SDK 单帧上限 128 KiB；ACK credit 耗尽时继续把新 packet 并入待发 batch，ACK 或路径中断直接唤醒发送循环。接收侧 DATA ACK 由每个 receiver 的写协程合并发送，不阻塞共享实时连接的读取。
 - 每个 peer 有界发送队列；队列满时丢包，TUN 读循环不会等待慢 Relay。
 - 同一 peer 在多 session 或重连重叠期间可以保留多条 Relay 接收路径；最低 `relay_id` 只决定当前 TUN 出站路径，非选中连接仍持续接收入站 packet，连接关闭后自动提升剩余路径。
 - SDK 收到无 live connection owner 的 non-OPEN Relay 帧时，TUN 记录 quoted `relay_id` 和 `kind`；日志不包含 payload、session 或凭据。

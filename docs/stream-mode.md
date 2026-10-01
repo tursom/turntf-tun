@@ -11,3 +11,9 @@ stream transport 或握手失败时，仅该 stream peer 会按 `dial_retry_inte
 会话解析和 Relay 建连尝试使用 `turntf.request_timeout` 限制响应等待，默认 `10s`；超时只取消当前尝试，后续按现有生命周期继续重试。stream 未确认数据的 ACK 停滞检测也覆盖队列空闲时的少量流量，避免小请求一直停留在坏 stream 而无法触发满窗口检测。默认停滞期限为 `5s`，空闲检测每四分之一期限采样一次；完全已确认的空闲 stream 保持连接，不会因没有业务流量被切换。
 
 Relay 与 stream 是单个 peer 上互斥的当前出口。stream 握手成功后立即接管该 peer 的 TUN 出口，但 Relay fallback 保持 warm；同一用户的多条入站 Relay 连接也都保持接收能力。stream 路径中断时先切回 Relay 出口，并使用原 stream ID 和未确认数据执行 `Resume`；如果远端已丢失 stream 状态且候选均不可恢复，则创建新的 stream。重建时旧 stream 队列与未确认 batch 会被释放，内层 TCP 通过自身重传恢复，UDP packet 可能丢失；重建只影响该 peer，保持 warm Relay 和其他 peer 的传输模式。
+
+## 吞吐
+
+TUN packet 以 2 字节长度前缀聚合成 batch，单帧不超过 SDK 的 128 KiB 上限，旧版本接收端可直接解码。发送窗口占满时，发送循环等待 ACK 或路径中断唤醒（单次等待最长 50ms，以保持 ACK 停滞采样），醒来后先把等待期间入队的 packet 并入同一 batch，负载越高帧越大，核心逐帧路由与 ACK 开销随之下降。
+
+接收侧收到 DATA 后只在共享读取协程中写 TUN，并把累计 ACK 交给该 receiver 的写协程；同一 epoch 内只保留最新的未发 ACK。`Resume` 的 ACK 仍同步发送并丢弃旧 epoch 的未发 ACK，receiver 被新 `Open` 替换或收到 `Close` 时停止写协程。

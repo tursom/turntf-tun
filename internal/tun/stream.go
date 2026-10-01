@@ -13,40 +13,63 @@ import (
 const (
 	streamOpenTimeout = 5 * time.Second
 	streamBatchWait   = 0
-	streamBatchMax    = 64 << 10
+	streamBatchMax    = turntf.DefaultStreamMaxFrame
+	// streamWindowWaitMax bounds one wait for ACK credit. ACKs and path loss
+	// wake the writer directly; the bound only keeps stall sampling moving.
+	streamWindowWaitMax = 50 * time.Millisecond
 )
 
 var streamPacketMagic = [2]byte{0x54, 0x50}
 
 var errStreamAckStalled = errors.New("stream acknowledgement stalled")
 
+func appendStreamPacket(batch, packet []byte) ([]byte, bool) {
+	if len(packet) > 0xffff || len(batch)+2+len(packet) > streamBatchMax {
+		return batch, false
+	}
+	var length [2]byte
+	binary.BigEndian.PutUint16(length[:], uint16(len(packet)))
+	batch = append(batch, length[:]...)
+	batch = append(batch, packet...)
+	return batch, true
+}
+
+func isStreamBatch(payload []byte) bool {
+	return len(payload) >= len(streamPacketMagic) && payload[0] == streamPacketMagic[0] && payload[1] == streamPacketMagic[1]
+}
+
+// appendStreamBatch drains already queued packets into an unsent batch without
+// waiting. A returned overflow packet must be sent before any later queue item.
+func appendStreamBatch(batch []byte, queue <-chan []byte) ([]byte, []byte) {
+	if !isStreamBatch(batch) {
+		return batch, nil
+	}
+	for {
+		select {
+		case packet := <-queue:
+			var added bool
+			if batch, added = appendStreamPacket(batch, packet); !added {
+				return batch, packet
+			}
+		default:
+			return batch, nil
+		}
+	}
+}
+
 func encodeStreamBatch(first []byte, queue <-chan []byte) ([]byte, []byte) {
 	batch := make([]byte, 0, len(first)+8)
 	batch = append(batch, streamPacketMagic[:]...)
 	appendPacket := func(packet []byte) bool {
-		if len(packet) > 0xffff || len(batch)+2+len(packet) > streamBatchMax {
-			return false
-		}
-		var length [2]byte
-		binary.BigEndian.PutUint16(length[:], uint16(len(packet)))
-		batch = append(batch, length[:]...)
-		batch = append(batch, packet...)
-		return true
+		var added bool
+		batch, added = appendStreamPacket(batch, packet)
+		return added
 	}
 	if !appendPacket(first) {
 		return first, nil
 	}
 	if streamBatchWait <= 0 {
-		for {
-			select {
-			case packet := <-queue:
-				if !appendPacket(packet) {
-					return batch, packet
-				}
-			default:
-				return batch, nil
-			}
-		}
+		return appendStreamBatch(batch, queue)
 	}
 	timer := time.NewTimer(streamBatchWait)
 	defer timer.Stop()
@@ -66,7 +89,7 @@ func encodeStreamBatch(first []byte, queue <-chan []byte) ([]byte, []byte) {
 }
 
 func decodeStreamBatch(payload []byte) ([][]byte, bool) {
-	if len(payload) < len(streamPacketMagic) || payload[0] != streamPacketMagic[0] || payload[1] != streamPacketMagic[1] {
+	if !isStreamBatch(payload) {
 		return nil, false
 	}
 	var packets [][]byte
@@ -95,6 +118,7 @@ type streamPort struct {
 	ready         chan struct{}
 	readyState    bool
 	lost          chan struct{}
+	wake          chan struct{}
 	resumeReady   chan struct{}
 	epoch         uint64
 	lastAck       uint64
@@ -251,6 +275,30 @@ func (p *streamPort) signalPathLost() {
 	case p.lost <- struct{}{}:
 	default:
 	}
+	p.wakeWriter()
+}
+
+// wakeWriter releases a writer waiting for ACK credit. The token is coalesced;
+// a stale token only causes one extra window check.
+func (p *streamPort) wakeWriter() {
+	select {
+	case p.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (p *streamPort) waitWriterWake(limit time.Duration) bool {
+	timer := time.NewTimer(limit)
+	defer timer.Stop()
+	select {
+	case <-p.done:
+		return false
+	case <-p.ctx.Done():
+		return false
+	case <-p.wake:
+	case <-timer.C:
+	}
+	return true
 }
 func (p *streamPort) beginResume(session turntf.SessionRef, epoch uint64) (uint64, <-chan struct{}, <-chan error) {
 	p.pathMu.Lock()
@@ -295,6 +343,7 @@ func (p *streamPort) acknowledge(session turntf.SessionRef, frame turntf.StreamF
 	if frame.Window > 0 {
 		p.lastWindow = frame.Window
 	}
+	p.wakeWriter()
 	if p.resumeReady != nil {
 		select {
 		case p.resumeReady <- struct{}{}:
@@ -476,7 +525,7 @@ func (r *Runtime) runStream(ctx context.Context, peer PeerConfig, streamReady, s
 		return streamRunFallback
 	}
 	portCtx, cancel := context.WithCancel(ctx)
-	port := &streamPort{runtime: r, peer: target, id: id, sender: turntf.NewStreamSenderState(id, 1, turntf.DefaultStreamWindow), queue: make(chan []byte, r.cfg.Transport.SendQueueSize), ready: make(chan struct{}), lost: make(chan struct{}, 1), epoch: 1, attemptErr: make(chan error, 1), ctx: portCtx, cancel: cancel, done: make(chan struct{}), restart: make(chan struct{})}
+	port := &streamPort{runtime: r, peer: target, id: id, sender: turntf.NewStreamSenderState(id, 1, turntf.DefaultStreamWindow), queue: make(chan []byte, r.cfg.Transport.SendQueueSize), ready: make(chan struct{}), lost: make(chan struct{}, 1), wake: make(chan struct{}, 1), epoch: 1, attemptErr: make(chan error, 1), ctx: portCtx, cancel: cancel, done: make(chan struct{}), restart: make(chan struct{})}
 	active := false
 	r.streamMu.Lock()
 	old := r.streamPorts[target]
@@ -666,6 +715,10 @@ func (r *Runtime) writeStreamLoop(p *streamPort) {
 	if checkInterval < time.Millisecond {
 		checkInterval = time.Millisecond
 	}
+	windowWait := checkInterval
+	if windowWait > streamWindowWaitMax {
+		windowWait = streamWindowWaitMax
+	}
 	ackCheck := time.NewTicker(checkInterval)
 	defer ackCheck.Stop()
 	for {
@@ -720,8 +773,13 @@ func (r *Runtime) writeStreamLoop(p *streamPort) {
 					stalled.reset()
 					continue
 				}
-				if !sleepContext(p.ctx, time.Millisecond) {
+				if !p.waitWriterWake(windowWait) {
 					return
+				}
+				if overflow == nil {
+					// Absorb the backlog queued while credit was exhausted so
+					// the next frame carries it, not one small frame per ACK.
+					pending, overflow = appendStreamBatch(pending, p.queue)
 				}
 				continue
 			}
@@ -769,6 +827,85 @@ type streamReceiver struct {
 	state         *turntf.StreamReceiverState
 	pathMu        sync.RWMutex
 	receivedOnce  sync.Once
+	ackMu         sync.Mutex
+	ackPending    *turntf.StreamFrame
+	ackWake       chan struct{}
+	ackStopped    bool
+}
+
+// queueAck hands a DATA acknowledgement to the receiver's writer so the shared
+// SDK reader never blocks on the WebSocket write. ACKs are cumulative within an
+// epoch, so only the newest unsent one is kept.
+func (r *streamReceiver) queueAck(rt *Runtime, ctx context.Context, ack turntf.StreamFrame) {
+	r.ackMu.Lock()
+	defer r.ackMu.Unlock()
+	if r.ackStopped {
+		return
+	}
+	r.ackPending = &ack
+	if r.ackWake == nil {
+		r.ackWake = make(chan struct{}, 1)
+		go r.ackLoop(rt, ctx, r.ackWake)
+	}
+	select {
+	case r.ackWake <- struct{}{}:
+	default:
+	}
+}
+
+// dropPendingAck discards an unsent ACK that a synchronous Resume ACK
+// supersedes; the Resume ACK already carries the receiver's current offset.
+func (r *streamReceiver) dropPendingAck() {
+	r.ackMu.Lock()
+	r.ackPending = nil
+	r.ackMu.Unlock()
+}
+
+func (r *streamReceiver) stopAcks() {
+	r.ackMu.Lock()
+	defer r.ackMu.Unlock()
+	r.ackStopped = true
+	r.ackPending = nil
+	if r.ackWake != nil {
+		select {
+		case r.ackWake <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (r *streamReceiver) takeAck() (turntf.StreamFrame, bool, bool) {
+	r.ackMu.Lock()
+	defer r.ackMu.Unlock()
+	if r.ackStopped {
+		return turntf.StreamFrame{}, false, true
+	}
+	if r.ackPending == nil {
+		return turntf.StreamFrame{}, false, false
+	}
+	ack := *r.ackPending
+	r.ackPending = nil
+	return ack, true, false
+}
+
+func (r *streamReceiver) ackLoop(rt *Runtime, ctx context.Context, wake <-chan struct{}) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-wake:
+		}
+		for {
+			ack, ok, stopped := r.takeAck()
+			if stopped {
+				return
+			}
+			if !ok {
+				break
+			}
+			_, _ = rt.sendStreamFrame(ctx, r.peer, r.session(), ack)
+		}
+	}
 }
 
 func (r *streamReceiver) session() turntf.SessionRef {
@@ -862,6 +999,7 @@ func (h runtimeHandler) OnStream(ctx context.Context, packet turntf.Packet, fram
 		for id, existing := range r.streamRecv {
 			if id != frame.ID && existing.peer == packet.Sender {
 				delete(r.streamRecv, id)
+				existing.stopAcks()
 			}
 		}
 		receiver := r.streamRecv[frame.ID]
@@ -919,7 +1057,7 @@ func (h runtimeHandler) OnStream(ctx context.Context, packet turntf.Packet, fram
 			}
 			r.writeMu.Unlock()
 		}
-		_, _ = r.sendStreamFrame(ctx, receiver.peer, receiver.session(), ack)
+		receiver.queueAck(r, ctx, ack)
 	case turntf.StreamFrameAck:
 		r.streamMu.RLock()
 		port := r.streamPorts[packet.Sender]
@@ -954,13 +1092,18 @@ func (h runtimeHandler) OnStream(ctx context.Context, packet turntf.Packet, fram
 					r.deactivateStreamIfNotReady(packet.Sender, lostPort)
 					r.logf("stream peer %d:%d resumed from new session; recovering outbound stream", packet.Sender.NodeID, packet.Sender.UserID)
 				}
+				receiver.dropPendingAck()
 				_, _ = r.sendStreamFrame(ctx, receiver.peer, receiver.session(), ack)
 			}
 		}
 	case turntf.StreamFrameClose:
 		r.streamMu.Lock()
+		receiver := r.streamRecv[frame.ID]
 		delete(r.streamRecv, frame.ID)
 		r.streamMu.Unlock()
+		if receiver != nil {
+			receiver.stopAcks()
+		}
 	}
 }
 

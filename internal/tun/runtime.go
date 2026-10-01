@@ -10,7 +10,11 @@ import (
 	turntf "github.com/tursom/turntf-go"
 )
 
-const relaySendBufferBytes = 8 << 20
+// relaySendBufferBytes sizes the SDK send channel (one slot per KiB). Keep it
+// shallow so Send blocks while the Relay window is full: packets then back up
+// in the peer queue and the next batch absorbs them, instead of thousands of
+// small 1ms batches bloating the SDK channel ahead of the window.
+const relaySendBufferBytes = 4 << 10
 
 type Logger interface{ Printf(string, ...any) }
 
