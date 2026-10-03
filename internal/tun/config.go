@@ -36,6 +36,7 @@ transport:
   max_packet_bytes: 65535
   dial_retry_interval: "3s"
   relay_window_size: 32
+  stream_window_bytes: 2097152
 peers:
   - name: "cc"
     user:
@@ -116,6 +117,9 @@ type TransportConfig struct {
 	MaxPacketBytes    int      `yaml:"max_packet_bytes"`
 	DialRetryInterval Duration `yaml:"dial_retry_interval"`
 	RelayWindowSize   int      `yaml:"relay_window_size"`
+	// StreamWindowBytes 是 stream 发送端在途未确认字节上限，随 Open 告知接收端。
+	// 丢包链路上确认被外层 TCP 重传拖慢，窗口需覆盖拉长后的确认往返。
+	StreamWindowBytes int `yaml:"stream_window_bytes"`
 }
 type PeerConfig struct {
 	Name          string        `yaml:"name"`
@@ -178,6 +182,9 @@ func (c *Config) ApplyDefaults() {
 	if c.Transport.RelayWindowSize == 0 {
 		c.Transport.RelayWindowSize = 32
 	}
+	if c.Transport.StreamWindowBytes == 0 {
+		c.Transport.StreamWindowBytes = turntf.DefaultStreamWindow
+	}
 	for i := range c.Peers {
 		if c.Peers[i].DialPolicy == "" {
 			c.Peers[i].DialPolicy = "auto"
@@ -223,6 +230,9 @@ func (c Config) Validate() error {
 	}
 	if c.Transport.RelayWindowSize < 1 || c.Transport.RelayWindowSize > 256 {
 		return errors.New("transport.relay_window_size must be between 1 and 256")
+	}
+	if c.Transport.StreamWindowBytes < 256<<10 || c.Transport.StreamWindowBytes > 64<<20 {
+		return errors.New("transport.stream_window_bytes must be between 262144 and 67108864")
 	}
 	for _, a := range c.Tun.Addresses {
 		if _, _, err := net.ParseCIDR(a); err != nil {

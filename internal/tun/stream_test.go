@@ -3,6 +3,9 @@ package tun
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1364,6 +1367,84 @@ func waitForStreamFrame(t *testing.T, frames <-chan sentStreamFrame, kind turntf
 			}
 		case <-timer.C:
 			t.Fatalf("timed out waiting for stream frame kind %d", kind)
+		}
+	}
+}
+
+func TestStreamWindowFollowsConfig(t *testing.T) {
+	const window = 512 << 10
+	peerRef := turntf.UserRef{NodeID: 21, UserID: 31}
+	peer := PeerConfig{Name: "peer", User: UserRefConfig{NodeID: peerRef.NodeID, UserID: peerRef.UserID}}
+	session := turntf.SessionRef{ServingNodeID: 41, SessionID: "session"}
+	sentCh := make(chan sentStreamFrame, 16)
+	r := &Runtime{
+		cfg:         Config{Transport: TransportConfig{SendQueueSize: 4, DialRetryInterval: Duration{Duration: time.Millisecond}, StreamWindowBytes: window}},
+		streamPorts: make(map[turntf.UserRef]*streamPort),
+		streamRecv:  make(map[turntf.StreamID]*streamReceiver),
+		streamResolve: func(context.Context, turntf.UserRef) (turntf.ResolvedUserSessions, error) {
+			return turntf.ResolvedUserSessions{Sessions: []turntf.ResolvedSession{{Session: session, TransientCapable: true}}}, nil
+		},
+		streamNewID: func() (turntf.StreamID, error) { return turntf.StreamID{7}, nil },
+		relayDial: func(ctx context.Context, _ PeerConfig) {
+			<-ctx.Done()
+		},
+		streamSend: func(_ context.Context, _ turntf.UserRef, target turntf.SessionRef, frame turntf.StreamFrame, _ turntf.DeliveryMode) (turntf.RelayAccepted, error) {
+			sentCh <- sentStreamFrame{session: target, frame: frame}
+			return turntf.RelayAccepted{}, nil
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	loopDone := make(chan struct{})
+	go func() {
+		r.streamLoop(ctx, peer)
+		close(loopDone)
+	}()
+	defer func() {
+		cancel()
+		<-loopDone
+	}()
+	open := waitForStreamFrame(t, sentCh, turntf.StreamFrameOpen)
+	if open.frame.Window != window {
+		t.Fatalf("Open window = %d, want %d", open.frame.Window, window)
+	}
+	r.streamMu.RLock()
+	port := r.streamPorts[peerRef]
+	r.streamMu.RUnlock()
+	// 发送端按配置窗口限流：填满 512KiB 后下一帧必须等待确认。
+	chunk := make([]byte, 128<<10)
+	for i := 0; i < window/len(chunk); i++ {
+		if _, err := port.sender.Data(chunk); err != nil {
+			t.Fatalf("chunk %d: %v", i, err)
+		}
+	}
+	if _, err := port.sender.Data(chunk); err != turntf.ErrStreamWindowFull {
+		t.Fatalf("beyond configured window: err=%v", err)
+	}
+}
+
+func TestStreamWindowConfigBounds(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(ExampleConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Transport.StreamWindowBytes != turntf.DefaultStreamWindow {
+		t.Fatalf("example stream window = %d", cfg.Transport.StreamWindowBytes)
+	}
+	unset := cfg
+	unset.Transport.StreamWindowBytes = 0
+	unset.ApplyDefaults()
+	if unset.Transport.StreamWindowBytes != turntf.DefaultStreamWindow {
+		t.Fatalf("default stream window = %d", unset.Transport.StreamWindowBytes)
+	}
+	for _, v := range []int{128 << 10, 65 << 20} {
+		bad := cfg
+		bad.Transport.StreamWindowBytes = v
+		if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "stream_window_bytes") {
+			t.Fatalf("window %d accepted: %v", v, err)
 		}
 	}
 }

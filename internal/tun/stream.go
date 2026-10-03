@@ -437,6 +437,14 @@ func (r *Runtime) newStreamID() (turntf.StreamID, error) {
 	return turntf.NewStreamID()
 }
 
+// streamWindow 返回配置的 stream 窗口；接收端按 Open 携带的窗口记账，新旧版本可混用。
+func (r *Runtime) streamWindow() uint64 {
+	if r.cfg.Transport.StreamWindowBytes > 0 {
+		return uint64(r.cfg.Transport.StreamWindowBytes)
+	}
+	return turntf.DefaultStreamWindow
+}
+
 func (r *Runtime) streamAttemptTimeout() time.Duration {
 	if r.streamTimeout > 0 {
 		return r.streamTimeout
@@ -525,7 +533,7 @@ func (r *Runtime) runStream(ctx context.Context, peer PeerConfig, streamReady, s
 		return streamRunFallback
 	}
 	portCtx, cancel := context.WithCancel(ctx)
-	port := &streamPort{runtime: r, peer: target, id: id, sender: turntf.NewStreamSenderState(id, 1, turntf.DefaultStreamWindow), queue: make(chan []byte, r.cfg.Transport.SendQueueSize), ready: make(chan struct{}), lost: make(chan struct{}, 1), wake: make(chan struct{}, 1), epoch: 1, attemptErr: make(chan error, 1), ctx: portCtx, cancel: cancel, done: make(chan struct{}), restart: make(chan struct{})}
+	port := &streamPort{runtime: r, peer: target, id: id, sender: turntf.NewStreamSenderState(id, 1, r.streamWindow()), queue: make(chan []byte, r.cfg.Transport.SendQueueSize), ready: make(chan struct{}), lost: make(chan struct{}, 1), wake: make(chan struct{}, 1), epoch: 1, attemptErr: make(chan error, 1), ctx: portCtx, cancel: cancel, done: make(chan struct{}), restart: make(chan struct{})}
 	active := false
 	r.streamMu.Lock()
 	old := r.streamPorts[target]
@@ -545,7 +553,7 @@ func (r *Runtime) runStream(ctx context.Context, peer PeerConfig, streamReady, s
 	if old != nil {
 		old.close()
 	}
-	open := turntf.StreamFrame{Kind: turntf.StreamFrameOpen, ID: id, Epoch: 1, Window: turntf.DefaultStreamWindow}
+	open := turntf.StreamFrame{Kind: turntf.StreamFrameOpen, ID: id, Epoch: 1, Window: r.streamWindow()}
 	opened := false
 	for _, candidate := range candidates {
 		ready, attemptErr := port.beginOpen(candidate)
