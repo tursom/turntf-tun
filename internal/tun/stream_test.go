@@ -1448,3 +1448,24 @@ func TestStreamWindowConfigBounds(t *testing.T) {
 		}
 	}
 }
+
+func TestRouteCongestionControlConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(ExampleConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Tun.RouteCongestionControl != "" {
+		t.Fatalf("default route congestion control = %q", cfg.Tun.RouteCongestionControl)
+	}
+	for name, ok := range map[string]bool{"cubic": true, "bbr": true, "": true, "Cubic": false, "cubic;x": false, "a234567890123456": false} {
+		c := cfg
+		c.Tun.RouteCongestionControl = name
+		if err := c.Validate(); (err == nil) != ok {
+			t.Fatalf("route_congestion_control %q: err=%v want ok=%v", name, err, ok)
+		}
+	}
+}

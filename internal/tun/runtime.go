@@ -138,7 +138,7 @@ func Run(ctx context.Context, cfg Config, logger Logger) error {
 	}
 	defer device.Close()
 	rt.cfg, rt.routes, rt.device, rt.connected = cfg, routes, device, true
-	if err := configureTUNRoutes(device.Name(), cfg.Peers); err != nil {
+	if err := configureTUNRoutes(device.Name(), cfg.Peers, cfg.Tun.RouteCongestionControl); err != nil {
 		return err
 	}
 	if rt.releaseLease != nil {

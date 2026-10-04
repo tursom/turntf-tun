@@ -105,11 +105,14 @@ type PasswordConfig struct {
 	Value  string `yaml:"value"`
 }
 type TunConfig struct {
-	Name          string   `yaml:"name"`
-	MTU           int      `yaml:"mtu"`
-	TxQueueLength int      `yaml:"tx_queue_length"`
-	Addresses     []string `yaml:"addresses"`
-	BringUp       bool     `yaml:"bring_up"`
+	Name          string `yaml:"name"`
+	MTU           int    `yaml:"mtu"`
+	TxQueueLength int    `yaml:"tx_queue_length"`
+	// RouteCongestionControl 为对端路由指定内层 TCP 的拥塞控制算法（如 cubic），为空沿用系统默认。
+	// 隧道内不丢包但外层重传带来延迟尖峰，按延迟估带宽的 bbr 会严重低估，按丢包的 cubic 不受影响。
+	RouteCongestionControl string   `yaml:"route_congestion_control"`
+	Addresses              []string `yaml:"addresses"`
+	BringUp                bool     `yaml:"bring_up"`
 }
 type TransportConfig struct {
 	Mode              string   `yaml:"mode"`
@@ -213,6 +216,9 @@ func (c Config) Validate() error {
 	if c.Tun.MTU < 576 || c.Tun.MTU > 65535 {
 		return errors.New("tun.mtu must be between 576 and 65535")
 	}
+	if !validCongestionName(c.Tun.RouteCongestionControl) {
+		return errors.New("tun.route_congestion_control must be empty or a kernel algorithm name such as cubic")
+	}
 	if c.Tun.TxQueueLength < 1 || c.Tun.TxQueueLength > 100000 {
 		return errors.New("tun.tx_queue_length must be between 1 and 100000")
 	}
@@ -315,4 +321,17 @@ func (p PasswordConfig) ToTurntf() (turntf.PasswordInput, error) {
 }
 func (u UserRefConfig) ToTurntf() turntf.UserRef {
 	return turntf.UserRef{NodeID: u.NodeID, UserID: u.UserID}
+}
+
+// validCongestionName 只接受内核拥塞控制模块名的字符集与长度（TCP_CA_NAME_MAX 含结尾 0 为 16）。
+func validCongestionName(name string) bool {
+	if len(name) > 15 {
+		return false
+	}
+	for _, r := range name {
+		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_') {
+			return false
+		}
+	}
+	return true
 }
